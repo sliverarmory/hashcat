@@ -103,7 +103,8 @@ static const u32   HASH_CATEGORY  = HASH_CATEGORY_ARCHIVE;
 static const char *HASH_NAME      = "PKZIP (Compressed Multi-File)";
 static const u64   KERN_TYPE      = 17220;
 static const u32   OPTI_TYPE      = 0;
-static const u64   OPTS_TYPE      = OPTS_TYPE_STOCK_MODULE;
+static const u64   OPTS_TYPE      = OPTS_TYPE_STOCK_MODULE
+                                 | OPTS_TYPE_NATIVE_THREADS;
 static const u32   SALT_TYPE      = SALT_TYPE_EMBEDDED;
 static const char *ST_PASS        = "hashcat";
 static const char *ST_HASH        = "$pkzip2$3*1*1*0*8*24*a425*8827*d1730095cd829e245df04ebba6c52c0573d49d3bbeab6cb385b7fa8a28dcccd3098bfdd7*1*0*8*24*2a74*882a*51281ac874a60baedc375ca645888d29780e20d4076edd1e7154a99bde982152a736311f*2*0*e3*1c5*eda7a8de*0*29*8*e3*eda7*5096*1455781b59707f5151139e018bdcfeebfc89bc37e372883a7ec0670a5eafc622feb338f9b021b6601a674094898a91beac70e41e675f77702834ca6156111a1bf7361bc9f3715d77dfcdd626634c68354c6f2e5e0a7b1e1ce84a44e632d0f6e36019feeab92fb7eac9dda8df436e287aafece95d042059a1b27d533c5eab62c1c559af220dc432f2eb1a38a70f29e8f3cb5a207704274d1e305d7402180fd47e026522792f5113c52a116d5bb25b67074ffd6f4926b221555234aabddc69775335d592d5c7d22462b75de1259e8342a9ba71cb06223d13c7f51f13be2ad76352c3b8ed*$/pkzip2$";
@@ -296,6 +297,8 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
     if (p == NULL) return PARSER_HASH_LENGTH;
     pkzip->hashes[i].data_length = strtoul (p, NULL, 16);
 
+    if (pkzip->hashes[i].data_length > MAX_DATA) return (PARSER_TOKEN_LENGTH);
+
     p = strtok_r (NULL, "*", &saveptr);
     if (p == NULL) return PARSER_HASH_LENGTH;
     u16 checksum_from_crc = 0;
@@ -318,7 +321,12 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
     p = strtok_r (NULL, "*", &saveptr);
     if (p == NULL) return PARSER_HASH_LENGTH;
 
-    hex_to_binary (p, strlen (p), (char *) &(pkzip->hashes[i].data));
+    const size_t data_hex_len = strlen (p);
+
+    if (data_hex_len > MAX_DATA * 2) return (PARSER_TOKEN_LENGTH);
+    if (data_hex_len % 2)            return (PARSER_TOKEN_LENGTH);
+
+    hex_to_binary (p, data_hex_len, (char *) &(pkzip->hashes[i].data));
 
     // fake salt
     salt->salt_buf[i] = pkzip->hashes[i].data[0];
@@ -399,6 +407,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_context_size             = MODULE_CONTEXT_SIZE_CURRENT;
   module_ctx->module_interface_version        = MODULE_INTERFACE_VERSION_CURRENT;
 
+  module_ctx->module_advice_notice            = MODULE_DEFAULT;
   module_ctx->module_attack_exec              = module_attack_exec;
   module_ctx->module_benchmark_esalt          = MODULE_DEFAULT;
   module_ctx->module_benchmark_hook_salt      = MODULE_DEFAULT;
@@ -415,7 +424,6 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_dgst_pos2                = module_dgst_pos2;
   module_ctx->module_dgst_pos3                = module_dgst_pos3;
   module_ctx->module_dgst_size                = module_dgst_size;
-  module_ctx->module_dictstat_disable         = MODULE_DEFAULT;
   module_ctx->module_esalt_size               = module_esalt_size;
   module_ctx->module_extra_buffer_size        = MODULE_DEFAULT;
   module_ctx->module_extra_tmp_size           = MODULE_DEFAULT;
@@ -473,5 +481,6 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_st_pass                  = module_st_pass;
   module_ctx->module_tmp_size                 = MODULE_DEFAULT;
   module_ctx->module_unstable_warning         = module_unstable_warning;
+  module_ctx->module_usage_notice             = MODULE_DEFAULT;
   module_ctx->module_warmup_disable           = MODULE_DEFAULT;
 }

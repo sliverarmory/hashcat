@@ -9,6 +9,7 @@
 #include "bitops.h"
 #include "convert.h"
 #include "shared.h"
+#include "parser.h"
 
 static const u32   ATTACK_EXEC    = ATTACK_EXEC_OUTSIDE_KERNEL;
 static const u32   DGST_POS0      = 0;
@@ -338,6 +339,12 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   if (u_len < 40) return (PARSER_SALT_VALUE);
 
+  // u_len is a field of its own and says nothing about how long the token that follows it is. The
+  // check and the loop below both read a fixed 80 characters out of that token, which the token
+  // framework allows to be as short as nothing, so its own length is what has to be checked.
+
+  if (token.len[9] < 80) return (PARSER_SALT_LENGTH);
+
   if (is_valid_hex_string (u_buf_pos, 80) == false) return (PARSER_SALT_ENCODING);
 
   for (int i = 0, j = 0; i < 8 + 2; i += 1, j += 8)
@@ -375,6 +382,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_context_size             = MODULE_CONTEXT_SIZE_CURRENT;
   module_ctx->module_interface_version        = MODULE_INTERFACE_VERSION_CURRENT;
 
+  module_ctx->module_advice_notice            = MODULE_DEFAULT;
   module_ctx->module_attack_exec              = module_attack_exec;
   module_ctx->module_benchmark_esalt          = MODULE_DEFAULT;
   module_ctx->module_benchmark_hook_salt      = MODULE_DEFAULT;
@@ -391,7 +399,6 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_dgst_pos2                = module_dgst_pos2;
   module_ctx->module_dgst_pos3                = module_dgst_pos3;
   module_ctx->module_dgst_size                = module_dgst_size;
-  module_ctx->module_dictstat_disable         = MODULE_DEFAULT;
   module_ctx->module_esalt_size               = module_esalt_size;
   module_ctx->module_extra_buffer_size        = MODULE_DEFAULT;
   module_ctx->module_extra_tmp_size           = MODULE_DEFAULT;
@@ -449,5 +456,6 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_st_pass                  = module_st_pass;
   module_ctx->module_tmp_size                 = module_tmp_size;
   module_ctx->module_unstable_warning         = module_unstable_warning;
+  module_ctx->module_usage_notice             = MODULE_DEFAULT;
   module_ctx->module_warmup_disable           = MODULE_DEFAULT;
 }

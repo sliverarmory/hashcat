@@ -1,0 +1,260 @@
+name: Build
+
+##
+## What is built, and what is run.
+##
+## The user base is Linux and Windows, so those two are built in both arrangements. Every build is
+## followed by the checks in tools/test_package.sh, because a build that links is not a build that
+## works: a plugin whose imports do not resolve, a package missing a directory and a core the loader
+## finds somewhere else all pass a compile and fail a user.
+##
+## Those checks ask nothing of a backend device, because a runner has none. Anything that needs one
+## says so and is left out here.
+##
+## macOS is built in the arrangement it ships in. FreeBSD stands in for the BSDs here, the other
+## three are built weekly by .github/workflows/bsd.yml.
+##
+## The cross compiled binaries are the ones that ship, so they are checked too, in the job that
+## builds them and before they are uploaded.
+##
+
+env:
+  include_paths: |
+    bridges/
+    charsets/
+    docs/
+    extra/
+    feeds/
+    layouts/
+    masks/
+    modules/
+    OpenCL/
+    pcfg/
+    rules/
+    tunings/
+    example*
+    hashcat*
+    libhashcat*
+    !**/*.debug
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - v*
+    paths:
+      - 'OpenCL/**.h'
+      - 'OpenCL/**.cl'
+      - 'include/**.h'
+      - 'src/**.c'
+      - 'src/**.mk'
+      - 'tools/**'
+      - '**/Makefile'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'OpenCL/**.h'
+      - 'OpenCL/**.cl'
+      - 'include/**.h'
+      - 'src/**.c'
+      - 'src/**.mk'
+      - 'tools/**'
+      - '**/Makefile'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os_name: Linux
+            os_name_lowercase: linux
+            shared: 0
+          - os: ubuntu-latest
+            os_name: Linux
+            os_name_lowercase: linux
+            shared: 1
+          - os: macos-latest
+            os_name: macOS
+            os_name_lowercase: macos
+            shared: 1
+          - os: windows-latest
+            os_name: Windows
+            os_name_lowercase: windows
+            shared: 0
+          - os: windows-latest
+            os_name: Windows
+            os_name_lowercase: windows
+            shared: 1
+          - os: freebsd
+            os_name: FreeBSD
+            os_name_lowercase: freebsd
+            shared: 0
+
+    name: Build ${{ matrix.os_name }} (${{ matrix.shared == 0 && 'Static' || 'Shared' }})
+    runs-on: ${{ matrix.os == 'freebsd' && 'ubuntu-latest' || matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Install dependencies (Windows only)
+        if: matrix.os_name_lowercase == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: |
+            gcc
+            git
+            make
+            mingw-w64-x86_64-clang
+            mingw-w64-x86_64-lld
+            mingw-w64-x86_64-llvm
+            mingw-w64-x86_64-rustup
+            mingw-w64-x86_64-toolchain
+            python3
+
+      - name: Setup Rustup (Windows only)
+        if: matrix.os_name_lowercase == 'windows'
+        shell: msys2 {0}
+        env:
+          PATH: /mingw64/bin:$PATH
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Build (Windows)
+        if: matrix.os_name_lowercase == 'windows'
+        shell: msys2 {0}
+        env:
+          SHARED: ${{ matrix.shared }}
+          PATH: /mingw64/bin:$PATH
+          WIN_PYTHON: ""
+        run: |
+          make ENABLE_LTO=0 CC=clang CXX=clang++
+          bash tools/test_package.sh . --no-device
+
+      - name: Build (Linux/macOS)
+        if: matrix.os_name_lowercase == 'linux' || matrix.os_name_lowercase == 'macos'
+        env:
+          SHARED: ${{ matrix.shared }}
+          TERM: xterm
+        run: |
+          make ENABLE_LTO=0 CC=clang CXX=clang++
+          bash tools/test_package.sh . --no-device
+
+      - name: Build (FreeBSD)
+        if: matrix.os_name_lowercase == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        env:
+          SHARED: ${{ matrix.shared }}
+        with:
+          usesh: true
+          envs: SHARED
+          prepare: |
+            pkg update
+            pkg install -y bash git gcc gmake gsed python3 rust llvm
+          run: |
+            gmake ENABLE_LTO=0 CC=clang CXX=clang++
+            bash tools/test_package.sh . --no-device
+
+      - name: Generate documentation
+        if: matrix.os_name_lowercase == 'linux' && matrix.shared == 0
+        env:
+          SHARED: ${{ matrix.shared }}
+          TERM: xterm
+        run: |
+         cd .github/workflows/
+         bash -v ./generate_docs.sh || true # make sure return code of generate docs is always successful (we don't want a build to break because of it..)
+
+      - name: Commit changes to docs
+        if: matrix.os_name_lowercase == 'linux' && matrix.shared == 0
+        env:
+          SHARED: ${{ matrix.shared }}
+        run: |
+          # https://github.com/actions/checkout?tab=readme-ov-file#push-a-commit-using-the-built-in-token
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/hashcat-help.md
+          git add docs/hashcat-example-hashes.md
+          if ! git diff --staged --quiet; then
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              if [ "$GITHUB_REF_NAME" = "master" ]; then
+                git commit -m "Automatically updated docs/hashcat-help.md or docs/hashcat-example-hashes.md (by Github Action)"
+                git push
+              else
+                echo "Not on master branch (currently: $GITHUB_REF_NAME): skipping commit because otherwise we may be in detached head"
+              fi
+            else
+              echo "docs/hashcat-help.md or docs/hashcat-example-hashes.md are not up-to-date:"
+              echo "..."
+              git diff --staged | cat
+              echo "..."
+              echo "this will be updated automatically when merged into master"
+            fi
+          else
+            echo "No need to update docs/hashcat-help.md or docs/hashcat-example-hashes.md"
+          fi
+
+      - name: Generate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashcat-${{ matrix.os_name_lowercase }}-${{ matrix.shared == 0 && 'static' || 'shared' }}
+          path: ${{ env.include_paths }}
+
+  binaries:
+    name: Build binaries (${{ matrix.shared == 0 && 'Static' || 'Shared' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shared: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+               wget ca-certificates zstd tar git make pkg-config llvm cmake g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 libc++-dev libc++abi-dev lld pkg-config python3
+
+          mkdir ~/src && cd ~/src
+          mkdir /opt/win-python && cd /opt/win-python
+          wget https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-python-3.12.11-1-any.pkg.tar.zst
+          unzstd mingw-w64-x86_64-python-3.12.11-1-any.pkg.tar.zst
+          tar -xf mingw-w64-x86_64-python-3.12.11-1-any.pkg.tar
+
+          cd ~/src
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+          export PATH="$HOME/.cargo/bin:${PATH}"
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Build binaries
+        env:
+          SHARED: ${{ matrix.shared }}
+          TERM: xterm
+        run: |
+          make binaries \
+               CC=clang CC_LINUX=clang CC_WIN=clang CXX=clang++ \
+               CXX_LINUX=clang++ CXX_WIN=clang++ \
+               AR=llvm-ar AR_LINUX=llvm-ar AR_WIN=llvm-ar
+
+      - name: Check what is about to be uploaded
+        run: bash tools/test_package.sh . --no-device
+
+      - name: Generate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashcat-cross-${{ matrix.shared == 0 && 'static' || 'shared' }}
+          path: ${{ env.include_paths }}
+

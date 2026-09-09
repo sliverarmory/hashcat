@@ -9,6 +9,7 @@ libhashcat.so.*
 libhashcat*.dylib
 hashcat.dll
 *.debugfile
+*.debug
 *.potfile
 *.restore
 *.dictstat2
@@ -20,6 +21,7 @@ hashcat.dll
 *.su
 kernels/**
 seekdbs/**
+pcfgdbs/**
 lib/*.a
 bridges/*.dll
 bridges/*.so
@@ -32,13 +34,41 @@ feeds/*.so
 obj/*/*/*.o
 obj/*.o
 obj/*.a
+obj/*/*/*.d
+obj/*.d
+obj/*.map
+obj/*.def
+obj/arrangement
+
+# obj/api.c is written by the build, and make clean deletes it. Tracked it would make every
+# tree that has been cleaned report as modified, and a fresh clone would find it already newer
+# than the headers it is derived from and never regenerate it
+obj/*.c
+libhashcat.so.*
+libhashcat.*.dylib
+hashcat.dll
 include/CL
 tools/luks_tests
 tools/luks2_tests
 .vscode
 test_edge*
+
+# tools/test.sh names its working directory test_<unix timestamp> and leaves it in the repository
+# root. Anchored and restricted to digits on purpose: a bare test_* would also match
+# tools/test_modules/ and hide every new test module from git.
+/test_[0-9]*/
+
+# ROCm's compiler writes its scratch tree into the current working directory rather than a temp
+# dir, and leaves it behind when a JIT compile is aborted, along with the preprocessed kernel it
+# was given. Running hashcat from the repository root is enough to collect them.
+comgr-*/
+*.hipi
+
 Rust/feeds/*/target
 Rust/bridges/*/target
+
+# Left behind by builds from before the bindings moved into OUT_DIR
+Rust/hashcat-sys/src/bindings.rs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -48,3 +78,4 @@ __pycache__/
 # Generated docs are overwritten anyway
 /docs/hashcat-example_hashes.md
 /docs/hashcat-help.md
+

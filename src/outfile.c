@@ -14,9 +14,13 @@
 #include "emu_inc_rp_optimized.h"
 #include "backend.h"
 #include "shared.h"
+#include "filehandling.h"
+#include "path.h"
 #include "locking.h"
 #include "thread.h"
 #include "outfile.h"
+
+#include <stdarg.h>
 
 u32 outfile_format_parse (const char *format_string)
 {
@@ -115,7 +119,6 @@ u32 outfile_format_parse (const char *format_string)
 
 int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, plain_t *plain, u32 *plain_buf, int *out_len)
 {
-  const combinator_ctx_t     *combinator_ctx     = hashcat_ctx->combinator_ctx;
   const hashconfig_t         *hashconfig         = hashcat_ctx->hashconfig;
   const hashes_t             *hashes             = hashcat_ctx->hashes;
   const mask_ctx_t           *mask_ctx           = hashcat_ctx->mask_ctx;
@@ -156,7 +159,31 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
 
       if (hashconfig->opti_type & OPTI_TYPE_OPTIMIZED_KERNEL)
       {
-        if ((user_options->rp_files_cnt == 0) && (user_options->rp_gen == 0))
+        // The device engine reaches the optimized kernels too, and the candidate is still the base word
+        // with the cell stepped to il_pos rather than the base word itself. Reporting the base word
+        // names a password that does not hash to the digest that was cracked, whichever kernel found
+        // it, so this has to happen on both sides of the optimized test rather than only the pure one.
+
+        if (user_options_extra->attack_kern == ATTACK_KERN_PCFG)
+        {
+          const generic_ctx_t *generic_ctx = &hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE];
+
+          for (int i = 0; i < 14; i++)
+          {
+            plain_buf[i] = pw.i[i];
+          }
+
+          plain_len = pw.pw_len;
+
+          // The candidate's own length, which is not the base word's on a ruleset whose buckets hold
+          // entries of more than one byte length. Reporting the base word's names a password that does
+          // not hash to the digest that was cracked, exactly as reporting the base word itself would.
+
+          const int amp_len = pcfg_expand (&device_param->pcfg_cells_buf[gidvid], generic_ctx->dev_pool, il_pos, plain_buf, (int) pw.pw_len);
+
+          if (amp_len >= 0) plain_len = amp_len;
+        }
+        else if ((user_options->rp_files_cnt == 0) && (user_options->rp_gen == 0))
         {
           for (int i = 0; i < 14; i++)
           {
@@ -182,39 +209,29 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
           plain_buf[i] = pw.i[i];
         }
 
-        plain_len = apply_rules (straight_ctx->kernel_rules_buf[off].cmds, plain_buf, pw.pw_len);
+        // The device engine's candidate is the base word with the cell's trailing slots stepped to il_pos,
+        // and no rule was ever applied to it. Reporting the base word instead names a password that
+        // does not hash to the digest that was cracked.
+
+        if (user_options_extra->attack_kern == ATTACK_KERN_PCFG)
+        {
+          const generic_ctx_t *generic_ctx = &hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE];
+
+          plain_len = pw.pw_len;
+
+          // The candidate's own length, which is not the base word's on a ruleset whose buckets hold
+          // entries of more than one byte length. Reporting the base word's names a password that does
+          // not hash to the digest that was cracked, exactly as reporting the base word itself would.
+
+          const int amp_len = pcfg_expand (&device_param->pcfg_cells_buf[gidvid], generic_ctx->dev_pool, il_pos, plain_buf, (int) pw.pw_len);
+
+          if (amp_len >= 0) plain_len = amp_len;
+        }
+        else
+        {
+          plain_len = apply_rules (straight_ctx->kernel_rules_buf[off].cmds, plain_buf, pw.pw_len);
+        }
       }
-    }
-    else if (user_options->attack_mode == ATTACK_MODE_COMBI)
-    {
-      pw_t pw;
-
-      const int rc = gidd_to_pw_t (hashcat_ctx, device_param, gidvid, &pw);
-
-      if (rc == -1) return -1;
-
-      for (int i = 0; i < 64; i++)
-      {
-        plain_buf[i] = pw.i[i];
-      }
-
-      plain_len = (int) pw.pw_len;
-
-      char *comb_buf = (char *) device_param->combs_buf[il_pos].i;
-      u32   comb_len =          device_param->combs_buf[il_pos].pw_len;
-
-      if (combinator_ctx->combs_mode == COMBINATOR_MODE_BASE_LEFT)
-      {
-        memcpy (plain_ptr + plain_len, comb_buf, (size_t) comb_len);
-      }
-      else
-      {
-        memmove (plain_ptr + comb_len, plain_ptr, (size_t) plain_len);
-
-        memcpy (plain_ptr, comb_buf, comb_len);
-      }
-
-      plain_len += comb_len;
     }
     else if (user_options->attack_mode == ATTACK_MODE_BF)
     {
@@ -232,7 +249,29 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
 
       plain_len = (int) mask_ctx->css_cnt;
     }
-    else if (user_options->attack_mode == ATTACK_MODE_HYBRID1)
+    else if ((user_options->attack_mode == ATTACK_MODE_HYBRID) && (user_options_extra->base_source == BASE_SOURCE_MASK))
+    {
+      // The mask is the base word and the wordlist amplifies it, so the candidate is put back together
+      // the way -a 7 puts it together under a pure kernel: the mask from the outer loop position, then
+      // the amplifier word behind it.
+
+      const u64 off = device_param->kernel_params_mp_buf64[3] + gidvid;
+
+      const u32 start = 0;
+      const u32 stop  = device_param->kernel_params_mp_buf32[4];
+
+      sp_exec (off, (char *) plain_ptr, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, start, start + stop);
+
+      plain_len = (int) stop;
+
+      const char *comb_buf = (const char *) device_param->combs_buf[il_pos].i;
+      const u32   comb_len =                device_param->combs_buf[il_pos].pw_len;
+
+      memcpy (plain_ptr + plain_len, comb_buf, comb_len);
+
+      plain_len += (int) comb_len;
+    }
+    else if (user_options->attack_mode == ATTACK_MODE_HYBRID)
     {
       pw_t pw;
 
@@ -240,76 +279,26 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
 
       if (rc == -1) return -1;
 
-      for (int i = 0; i < 64; i++)
+      // Taken back out of the amplifier the host built, which is the record of what the kernel was
+      // actually given. The one shape whose mask the mask processor produces on the device has no host
+      // copy to read, and it is also the one shape whose item is always at its own position, so there
+      // the mask is produced again from that position instead.
+
+      if (device_param->combs_on_host == true)
       {
-        plain_buf[i] = pw.i[i];
-      }
-
-      plain_len = (int) pw.pw_len;
-
-      u64 off = device_param->kernel_params_mp_buf64[3] + il_pos;
-
-      u32 start = 0;
-      u32 stop  = device_param->kernel_params_mp_buf32[4];
-
-      sp_exec (off, (char *) plain_ptr + plain_len, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, start, start + stop);
-
-      plain_len += start + stop;
-    }
-    else if (user_options->attack_mode == ATTACK_MODE_HYBRID2)
-    {
-      if (hashconfig->opti_type & OPTI_TYPE_OPTIMIZED_KERNEL)
-      {
-        pw_t pw;
-
-        const int rc = gidd_to_pw_t (hashcat_ctx, device_param, gidvid, &pw);
-
-        if (rc == -1) return -1;
-
-        for (int i = 0; i < 64; i++)
-        {
-          plain_buf[i] = pw.i[i];
-        }
-
-        plain_len = (int) pw.pw_len;
-
-        u64 off = device_param->kernel_params_mp_buf64[3] + il_pos;
-
-        u32 start = 0;
-        u32 stop  = device_param->kernel_params_mp_buf32[4];
-
-        memmove (plain_ptr + stop, plain_ptr, plain_len);
-
-        sp_exec (off, (char *) plain_ptr, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, start, start + stop);
-
-        plain_len += start + stop;
+        plain_len = (int) hybrid_amp_rebuild (hashcat_ctx, device_param, il_pos, plain_ptr, (const u8 *) pw.i, pw.pw_len);
       }
       else
       {
-        pw_t pw;
+        const u64 off = device_param->kernel_params_mp_buf64[3] + il_pos;
 
-        const int rc = gidd_to_pw_t (hashcat_ctx, device_param, gidvid, &pw);
+        char mask_buf[256];
 
-        if (rc == -1) return -1;
+        hybrid_amp_mask (hashcat_ctx, off, mask_buf);
 
-        u64 off = device_param->kernel_params_mp_buf64[3] + gidvid;
-
-        u32 start = 0;
-        u32 stop  = device_param->kernel_params_mp_buf32[4];
-
-        sp_exec (off, (char *) plain_ptr, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, start, start + stop);
-
-        plain_len = stop;
-
-        char *comb_buf = (char *) device_param->combs_buf[il_pos].i;
-        u32   comb_len =          device_param->combs_buf[il_pos].pw_len;
-
-        memcpy (plain_ptr + plain_len, comb_buf, comb_len);
-
-        plain_len += comb_len;
+        plain_len = (int) hybrid_assemble (hashcat_ctx, plain_ptr, mask_buf, (const u8 *) pw.i, pw.pw_len, NULL, 0);
       }
     }
-
     if (user_options->attack_mode == ATTACK_MODE_BF)
     {
       if (hashconfig->opti_type & OPTI_TYPE_BRUTE_FORCE) // lots of optimizations can happen here
@@ -348,9 +337,17 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
 
   // pw_max is per pw_t element but in combinator we have two pw_t elements.
   // therefore we can support up to 64 in combinator in optimized mode (but limited by general hash limit 55)
-  // or full 512 in pure mode (but limited by hashcat buffer size limit 256).
+  // or the full 2 * PW_MAX in pure mode.
   // some algorithms do not support general default pw_max = 31,
   // therefore we need to use pw_max as a base and not hardcode it.
+  //
+  // The pure branch used to cap at 256 for "hashcat buffer size limit 256",
+  // which no longer holds: every consumer of plain_ptr is sized for the full
+  // combinator length. status.c uses u32[(64 * 2) + 2], which is exactly
+  // 2 * PW_MAX plus room for the terminator, and hashes.c uses HCBUFSIZ_TINY
+  // before handing off to HCBUFSIZ_LARGE writers. Capping below the real
+  // maximum silently reported a truncated password that does not hash to the
+  // digest it was reported against.
 
   if (plain_len > pw_max)
   {
@@ -362,7 +359,7 @@ int build_plain (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, pl
       }
       else
       {
-        pw_max = MIN ((pw_max * 2), 256);
+        pw_max = MIN ((pw_max * 2), PW_MAX * 2);
       }
     }
   }
@@ -387,7 +384,9 @@ int build_crackpos (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
   const u64 gidvid = plain->gidvid;
   const u32 il_pos = plain->il_pos;
 
-  u64 crackpos = device_param->words_off;
+  // The batch being launched, and not the one the producer has moved on to filling.
+
+  u64 crackpos = device_param->words_off_launch;
 
   if (user_options->slow_candidates == true)
   {
@@ -528,17 +527,50 @@ void outfile_destroy (hashcat_ctx_t *hashcat_ctx)
   memset (outfile_ctx, 0, sizeof (outfile_ctx_t));
 }
 
+// The file is opened and closed around every cracked hash so that a user can move the outfile while
+// hashcat runs. That costs an open, a lock, a close and an unlock per result, and a launch against a
+// large list can return tens of thousands of them, all inside the display mutex. A batch holds the
+// file open across one launch's worth of results and closes it when the launch is done, so the
+// outfile is still a live stream and can still be moved between launches rather than between hashes.
+
+void outfile_batch_begin (hashcat_ctx_t *hashcat_ctx)
+{
+  outfile_ctx_t *outfile_ctx = hashcat_ctx->outfile_ctx;
+
+  if (outfile_ctx->batch_depth == 0)
+  {
+    if (outfile_write_open (hashcat_ctx) == -1) return;
+  }
+
+  outfile_ctx->batch_depth++;
+}
+
+void outfile_batch_end (hashcat_ctx_t *hashcat_ctx)
+{
+  outfile_ctx_t *outfile_ctx = hashcat_ctx->outfile_ctx;
+
+  if (outfile_ctx->batch_depth == 0) return;
+
+  outfile_ctx->batch_depth--;
+
+  if (outfile_ctx->batch_depth == 0) outfile_write_close (hashcat_ctx);
+}
+
 int outfile_write_open (hashcat_ctx_t *hashcat_ctx)
 {
   outfile_ctx_t *outfile_ctx = hashcat_ctx->outfile_ctx;
 
   if (outfile_ctx->filename == NULL) return 0;
 
+  // already held open by a batch
+
+  if ((outfile_ctx->batch_depth > 0) && (outfile_ctx->fp.pfp != NULL)) return 0;
+
   if (outfile_ctx->is_fifo == false || outfile_ctx->fp.pfp == NULL)
   {
     if (hc_fopen (&outfile_ctx->fp, outfile_ctx->filename, "ab") == false)
     {
-      event_log_error (hashcat_ctx, "%s: %s", outfile_ctx->filename, strerror (errno));
+      event_log_error (hashcat_ctx, "%s: %s", outfile_ctx->filename, hc_fopen_strerror ());
 
       return -1;
     }
@@ -562,6 +594,15 @@ void outfile_write_close (hashcat_ctx_t *hashcat_ctx)
 
   if (outfile_ctx->fp.pfp == NULL) return;
 
+  // a batch closes it, not the write inside one
+
+  if (outfile_ctx->batch_depth > 0)
+  {
+    hc_fflush (&outfile_ctx->fp);
+
+    return;
+  }
+
   if (outfile_ctx->is_fifo == true)
   {
     hc_fflush (&outfile_ctx->fp);
@@ -571,6 +612,28 @@ void outfile_write_close (hashcat_ctx_t *hashcat_ctx)
   hc_unlockfile (&outfile_ctx->fp);
 
   hc_fclose (&outfile_ctx->fp);
+}
+
+// The bounded appenders these used to define now live in src/shared.c, because potfile.c builds the
+// same kind of line into the same size of buffer and needs the same clamping. outfile_append_fmt ()
+// stays here: it is this file's JSON formatter, it carries a printf format attribute, and vsnprintf
+// bounds it already.
+
+static int outfile_append_fmt (char *buf, const int len, const char *fmt, ...)
+{
+  const int room = (int) HCBUFSIZ_LARGE - len;
+
+  va_list ap;
+
+  va_start (ap, fmt);
+
+  const int n = vsnprintf (buf + len, (size_t) room, fmt, ap);
+
+  va_end (ap);
+
+  if (n >= room) return len + room - 1;
+
+  return len + n;
 }
 
 int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int out_len, const unsigned char *plain_ptr, const u32 plain_len, const u64 crackpos, const unsigned char *username, const u32 user_len, const bool print_eol, char *tmp_buf)
@@ -585,66 +648,64 @@ int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int ou
 
   if (outfile_ctx->outfile_json == true)
   {
-    tmp_buf[0] = '{'; tmp_len += 1;
+    tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '{');
 
     if (user_len > 0)
     {
       if (username != NULL)
       {
-        tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "\"username_hex\": ");
+        tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "\"username_hex\": ");
 
-        tmp_buf[tmp_len] = '"'; tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-        tmp_len += hex_encode ((const u8 *) username, user_len, (u8 *) tmp_buf + tmp_len);
+        tmp_len = hc_append_hex (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) username, (int) user_len);
 
-        tmp_buf[tmp_len] = '"'; tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-        tmp_buf[tmp_len] = ','; tmp_len += 1;
-        tmp_buf[tmp_len] = ' '; tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ',');
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ' ');
       }
     }
 
     if (hashes->hashlist_mode == HL_MODE_FILE_BINARY)
     {
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "\"filename_hex\": ");
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "\"filename_hex\": ");
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-      tmp_len += hex_encode ((const u8 *) hashes->hashfile, strlen (hashes->hashfile), (u8 *) tmp_buf + tmp_len);
+      tmp_len = hc_append_hex (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) hashes->hashfile, (int) strlen (hashes->hashfile));
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-      tmp_buf[tmp_len] = ','; tmp_len += 1;
-      tmp_buf[tmp_len] = ' '; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ',');
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ' ');
     }
     else
     {
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "\"hash_hex\": ");
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "\"hash_hex\": ");
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-      tmp_len += hex_encode ((const u8 *) out_buf, out_len, (u8 *) tmp_buf + tmp_len);
+      tmp_len = hc_append_hex (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) out_buf, (int) out_len);
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-      tmp_buf[tmp_len] = ','; tmp_len += 1;
-      tmp_buf[tmp_len] = ' '; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ',');
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ' ');
     }
 
     if (1) // plain
     {
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "\"password_hex\": ");
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "\"password_hex\": ");
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
 
-      tmp_len += hex_encode ((const u8 *) plain_ptr, plain_len, (u8 *) tmp_buf + tmp_len);
+      tmp_len = hc_append_hex (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) plain_ptr, (int) plain_len);
 
-      tmp_buf[tmp_len] = '"'; tmp_len += 1;
+      tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '"');
     }
 
-    tmp_buf[tmp_len] = '}';
-
-    tmp_len += 1;
+    tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '}');
   }
   else
   {
@@ -654,15 +715,11 @@ int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int ou
     {
       if (username != NULL)
       {
-        memcpy (tmp_buf + tmp_len, username, user_len);
-
-        tmp_len += user_len;
+        tmp_len = hc_append_raw (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) username, (int) user_len);
 
         if (outfile_format & (OUTFILE_FMT_TIME_ABS | OUTFILE_FMT_TIME_REL | OUTFILE_FMT_HASH | OUTFILE_FMT_PLAIN | OUTFILE_FMT_HEXPLAIN | OUTFILE_FMT_CRACKPOS))
         {
-          tmp_buf[tmp_len] = hashconfig->separator;
-
-          tmp_len += 1;
+          tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
         }
       }
     }
@@ -673,13 +730,11 @@ int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int ou
 
       time (&now);
 
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "%" PRIu64, (u64) now);
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "%" PRIu64, (u64) now);
 
       if (outfile_format & (OUTFILE_FMT_TIME_REL | OUTFILE_FMT_HASH | OUTFILE_FMT_PLAIN | OUTFILE_FMT_HEXPLAIN | OUTFILE_FMT_CRACKPOS))
       {
-        tmp_buf[tmp_len] = hashconfig->separator;
-
-        tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
       }
     }
 
@@ -698,27 +753,21 @@ int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int ou
         diff = (u64) time_now - (u64) time_started;
       }
 
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "%" PRIu64, diff);
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "%" PRIu64, diff);
 
       if (outfile_format & (OUTFILE_FMT_HASH | OUTFILE_FMT_PLAIN | OUTFILE_FMT_HEXPLAIN | OUTFILE_FMT_CRACKPOS))
       {
-        tmp_buf[tmp_len] = hashconfig->separator;
-
-        tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
       }
     }
 
     if (outfile_format & OUTFILE_FMT_HASH)
     {
-      memcpy (tmp_buf + tmp_len, out_buf, out_len);
-
-      tmp_len += out_len;
+      tmp_len = hc_append_raw (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) out_buf, (int) out_len);
 
       if (outfile_format & (OUTFILE_FMT_PLAIN | OUTFILE_FMT_HEXPLAIN | OUTFILE_FMT_CRACKPOS))
       {
-        tmp_buf[tmp_len] = hashconfig->separator;
-
-        tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
       }
     }
 
@@ -738,50 +787,40 @@ int outfile_write (hashcat_ctx_t *hashcat_ctx, const char *out_buf, const int ou
 
       if (convert_to_hex)
       {
-        tmp_buf[tmp_len++] = '$';
-        tmp_buf[tmp_len++] = 'H';
-        tmp_buf[tmp_len++] = 'E';
-        tmp_buf[tmp_len++] = 'X';
-        tmp_buf[tmp_len++] = '[';
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '$');
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, 'H');
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, 'E');
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, 'X');
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, '[');
 
-        exec_hexify (plain_ptr, plain_len, (u8 *) tmp_buf + tmp_len);
+        tmp_len = hc_append_hexify (tmp_buf, tmp_len, HCBUFSIZ_LARGE, plain_ptr, (int) plain_len);
 
-        tmp_len += plain_len * 2;
-
-        tmp_buf[tmp_len++] = ']';
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, ']');
       }
       else
       {
-        memcpy (tmp_buf + tmp_len, plain_ptr, plain_len);
-
-        tmp_len += plain_len;
+        tmp_len = hc_append_raw (tmp_buf, tmp_len, HCBUFSIZ_LARGE, (const u8 *) plain_ptr, (int) plain_len);
       }
 
       if (outfile_format & (OUTFILE_FMT_HEXPLAIN | OUTFILE_FMT_CRACKPOS))
       {
-        tmp_buf[tmp_len] = hashconfig->separator;
-
-        tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
       }
     }
 
     if (outfile_format & OUTFILE_FMT_HEXPLAIN)
     {
-      exec_hexify (plain_ptr, plain_len, (u8 *) tmp_buf + tmp_len);
-
-      tmp_len += plain_len * 2;
+      tmp_len = hc_append_hexify (tmp_buf, tmp_len, HCBUFSIZ_LARGE, plain_ptr, (int) plain_len);
 
       if (outfile_format & (OUTFILE_FMT_CRACKPOS))
       {
-        tmp_buf[tmp_len] = hashconfig->separator;
-
-        tmp_len += 1;
+        tmp_len = hc_append_chr (tmp_buf, tmp_len, HCBUFSIZ_LARGE, hashconfig->separator);
       }
     }
 
     if (outfile_format & OUTFILE_FMT_CRACKPOS)
     {
-      tmp_len += snprintf (tmp_buf + tmp_len, HCBUFSIZ_LARGE - tmp_len, "%" PRIu64, crackpos);
+      tmp_len = outfile_append_fmt (tmp_buf, tmp_len, "%" PRIu64, crackpos);
     }
   }
 

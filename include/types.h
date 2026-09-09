@@ -12,25 +12,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <math.h>
-#include <zlib.h>
-
-#if !defined(__MACTYPES__)
-#define __MACTYPES__
-#include "ext_lzma.h"
-#undef __MACTYPES__
-#endif
-// end of workaround
-
-#if defined (_WIN)
-#define WINICONV_CONST
-#endif
-
-#include <iconv.h>
 
 #if defined (_WIN)
 #include <windows.h>
@@ -73,18 +60,29 @@ typedef struct timespec   hc_timer_t;
 
 #if defined (_POSIX)
 #include <pthread.h>
+#if defined (__APPLE__)
+#include <dispatch/dispatch.h>
+#else
 #include <semaphore.h>
-#endif
+#endif // __APPLE__
+#endif // _POSIX
 
 #if defined (_WIN)
-typedef HANDLE           hc_thread_t;
-typedef CRITICAL_SECTION hc_thread_mutex_t;
-typedef HANDLE           hc_thread_semaphore_t;
+typedef HANDLE             hc_thread_t;
+typedef CRITICAL_SECTION   hc_thread_mutex_t;
+typedef CONDITION_VARIABLE hc_thread_cond_t;
+typedef HANDLE             hc_thread_semaphore_t;
 #else
-typedef pthread_t        hc_thread_t;
-typedef pthread_mutex_t  hc_thread_mutex_t;
-typedef sem_t            hc_thread_semaphore_t;
-#endif
+typedef pthread_t          hc_thread_t;
+typedef pthread_mutex_t    hc_thread_mutex_t;
+typedef pthread_cond_t     hc_thread_cond_t;
+
+#if defined (__APPLE__)
+typedef dispatch_semaphore_t hc_thread_semaphore_t;
+#else
+typedef sem_t                hc_thread_semaphore_t;
+#endif // __APPLE__
+#endif // _WIN
 
 // enums
 
@@ -112,6 +110,8 @@ typedef enum event_identifier
   EVENT_BITMAP_FINAL_OVERFLOW     = 0x00000012,
   EVENT_BRIDGES_INIT_POST         = 0x00000120,
   EVENT_BRIDGES_INIT_PRE          = 0x00000121,
+  EVENT_CANDIDATE_SOURCE_POST     = 0x00000142,
+  EVENT_CANDIDATE_SOURCE_PRE      = 0x00000143,
   EVENT_BRIDGES_SALT_POST         = 0x00000122,
   EVENT_BRIDGES_SALT_PRE          = 0x00000123,
   EVENT_CALCULATED_WORDS_BASE     = 0x00000020,
@@ -120,11 +120,17 @@ typedef enum event_identifier
   EVENT_CRACKER_FINISHED          = 0x00000030,
   EVENT_CRACKER_HASH_CRACKED      = 0x00000031,
   EVENT_CRACKER_STARTING          = 0x00000032,
+  EVENT_GENERIC_INIT_POST         = 0x00000140,
+  EVENT_GENERIC_INIT_PRE          = 0x00000141,
   EVENT_HASHCONFIG_PRE            = 0x00000040,
   EVENT_HASHCONFIG_POST           = 0x00000041,
   EVENT_HASHLIST_COUNT_LINES_POST = 0x00000050,
   EVENT_HASHLIST_COUNT_LINES_PRE  = 0x00000051,
   EVENT_HASHLIST_PARSE_HASH       = 0x00000052,
+  EVENT_HASHLIST_PARSE_INPUT_POST = 0x00000059,
+  EVENT_HASHLIST_PARSE_INPUT_PRE  = 0x0000005a,
+  EVENT_KERNEL_BUILD_POST         = 0x00000144,
+  EVENT_KERNEL_BUILD_PRE          = 0x00000145,
   EVENT_HASHLIST_SORT_HASH_POST   = 0x00000053,
   EVENT_HASHLIST_SORT_HASH_PRE    = 0x00000054,
   EVENT_HASHLIST_SORT_SALT_POST   = 0x00000055,
@@ -142,6 +148,7 @@ typedef enum event_identifier
   EVENT_MONITOR_RUNTIME_LIMIT     = 0x00000090,
   EVENT_MONITOR_STATUS_REFRESH    = 0x00000091,
   EVENT_MONITOR_TEMP_ABORT        = 0x00000092,
+  EVENT_MONITOR_TEMP_ABORT_FEEDER = 0x00000099,
   EVENT_MONITOR_THROTTLE1         = 0x00000093,
   EVENT_MONITOR_THROTTLE2         = 0x00000094,
   EVENT_MONITOR_THROTTLE3         = 0x00000095,
@@ -182,6 +189,12 @@ typedef enum amplifier_count
 
 } amplifier_count_t;
 
+// How many pieces one amplifier item is cut into. Every attack mode but -a 12 uses one, the single
+// buffer that is appended to the base word. -a 12 uses four: the mask in front of the base word, the
+// mask between the two words, the second word, and the mask behind the last word.
+
+#define COMBS_PIECE_CNT 4
+
 typedef enum vendor_id
 {
   VENDOR_ID_AMD           = (1U << 0),
@@ -197,6 +210,33 @@ typedef enum vendor_id
   VENDOR_ID_GENERIC       = (1U << 31)
 
 } vendor_id_t;
+
+// Where device_available_mem came from. The difference that matters is whether it was measured or
+// guessed: a guess has to be padded against desktop activity, a measurement must not be, because
+// padding a good number throws away a third of the card for nothing.
+
+// Private memory per work item beyond which a kernel is treated as spill-heavy and given the native
+// thread count. Measured on an RTX 4090 across the 481 shipped modules that report a figure: 392 of
+// them stay under 1024 bytes, and the largest that is not spill-heavy is BestCrypt v4 at 6336. Above
+// the cut are yescrypt at 8800, gost-yescrypt at 10032, MD6 at 16400, Electrum salt-type 5 at 46696,
+// and the 3 PKZIP inflate kernels at 77688. Nothing measures between 6336 and 8800, so the cut sits
+// in an empty range and does not depend on where exactly it falls.
+//
+// The guard reaches 2 of those 7. The PKZIP modules ask for the native thread count themselves, and
+// the 2 yescrypt modes pin a thread count the guard leaves alone.
+
+#define SPILL_HEAVY_PRIVATE_BYTES 8192
+
+typedef enum mem_source
+{
+  MEM_SOURCE_UNKNOWN   = 0,   // nothing asked; derived from the physical size
+  MEM_SOURCE_RUNTIME   = 1,   // cuMemGetInfo () / hipMemGetInfo ()
+  MEM_SOURCE_ALIAS     = 2,   // copied from the CUDA or HIP view of the same device
+  MEM_SOURCE_EXTENSION = 3,   // CL_DEVICE_GLOBAL_FREE_MEMORY_AMD
+  MEM_SOURCE_HWMON     = 4,   // the hardware monitor's used-memory reading
+  MEM_SOURCE_PROBE     = 5,   // measured by allocating until it fails
+
+} mem_source_t;
 
 typedef enum st_status_rc
 {
@@ -249,11 +289,75 @@ typedef enum wl_mode
 {
   WL_MODE_NONE    = 0,
   WL_MODE_STDIN   = 1,
-  WL_MODE_FILE    = 2,
-  WL_MODE_MASK    = 3,
-  WL_MODE_GENERIC = 4,
+  WL_MODE_MASK    = 2,
+  WL_MODE_GENERIC = 3,
 
 } wl_mode_t;
+
+// Where an attack takes its base words from. This is not the attack mode and must not be confused with
+// it: the attack mode says what the user asked for, this says which producer fills a batch. The two
+// disagree wherever the same mode can take its base words from more than one place. -a 7 is the
+// clearest: under the optimized kernel the dictionary is the base and the mask is the amplifier, and
+// under the pure kernel it is the other way round.
+//
+// The alternative was to rewrite the attack mode itself, which is what hashcat used to do. Every test
+// on the attack mode that ran afterwards then silently meant something else, and --loopback stopped
+// working with no message because of exactly that.
+
+typedef enum base_source
+{
+  BASE_SOURCE_NONE = 0,
+  BASE_SOURCE_MASK = 1,
+  BASE_SOURCE_FEED = 2,
+
+} base_source_t;
+
+// Where the ?w marker goes on a mask that was not typed with one. -a 1, -a 6 and -a 7 are rewritten
+// into -a 12 masks, and the marker is put on each mask as it is appended rather than on the argument,
+// so that a mask file gets it per line and --increment gets it per length.
+
+typedef enum marker_policy
+{
+  MARKER_POLICY_NONE     = 0,
+  MARKER_POLICY_PREFIX_W = 1,
+  MARKER_POLICY_SUFFIX_W = 2,
+
+} marker_policy_t;
+
+// How much of the attack one feed instance covers.
+//
+// Normally all of it: every dictionary is laid end to end into one keyspace, which is what makes
+// --skip and --limit work across all of them and what -a 0 has done since the flip.
+//
+// Two things cannot be expressed that way, and both are a queue of attacks rather than one attack.
+// An induction round produces its dictionary during the run, so it does not exist when the instance
+// would have to be opened. -a 9 pairs word N with salt N, so several dictionaries are several
+// attacks over the same salts and laying them end to end would change what the run means. Both get
+// one instance per round over the one dictionary that round reads.
+
+typedef enum base_scope
+{
+  BASE_SCOPE_ALL_SOURCES = 0,
+  BASE_SCOPE_PER_ROUND   = 1,
+
+} base_scope_t;
+
+// Which lengths an attack will accept for a base word, and the whole of the difference between the
+// attack modes on that question.
+//
+// -a 0 applies both of the hash mode's bounds, because a base word is already the whole candidate. The
+// combinator kernels apply only the upper one: the base word is half a candidate and the other half has
+// not been added yet, so a short one is not too short. -a 9 applies neither, and that is not a relaxation
+// but a requirement. Word N belongs to salt N, so dropping one moves every later word onto the wrong
+// hash.
+
+typedef enum base_length
+{
+  BASE_LENGTH_BOTH = 0,
+  BASE_LENGTH_MAX  = 1,
+  BASE_LENGTH_NONE = 2,
+
+} base_length_t;
 
 typedef enum hl_mode
 {
@@ -269,12 +373,13 @@ typedef enum attack_mode
   ATTACK_MODE_COMBI       = 1,
   ATTACK_MODE_TOGGLE      = 2,
   ATTACK_MODE_BF          = 3,
-  ATTACK_MODE_PERM        = 4,
+  ATTACK_MODE_PCFG        = 4,
   ATTACK_MODE_TABLE       = 5,
   ATTACK_MODE_HYBRID1     = 6,
   ATTACK_MODE_HYBRID2     = 7,
   ATTACK_MODE_GENERIC     = 8,
   ATTACK_MODE_ASSOCIATION = 9,
+  ATTACK_MODE_HYBRID      = 12,
   ATTACK_MODE_NONE        = 100
 
 } attack_mode_t;
@@ -284,6 +389,7 @@ typedef enum attack_kern
   ATTACK_KERN_STRAIGHT  = 0,
   ATTACK_KERN_COMBI     = 1,
   ATTACK_KERN_BF        = 3,
+  ATTACK_KERN_PCFG      = 4,
   ATTACK_KERN_NONE      = 100
 
 } attack_kern_t;
@@ -515,8 +621,13 @@ typedef enum opts_type
 typedef enum bridge_type
 {
   BRIDGE_TYPE_NONE                   = 0,            // no bridge support
-  BRIDGE_TYPE_MATCH_TUNINGS          = (1ULL <<  1), // Disables autotune and adjusts -n, -u and -T for the backend device according to match bridge dimensions
   BRIDGE_TYPE_UPDATE_SELFTEST        = (1ULL <<  2), // updates the selftest configured in the module. Can be useful for generic hash modes such as the python one
+
+  // launch_loop() honours kernel_param.loop_pos and .loop_cnt, so hashcat may split the salt's
+  // iteration space into chunks and call it once per chunk. Without this the bridge is handed the
+  // whole range in a single call, which is what a one-shot implementation needs.
+
+  BRIDGE_TYPE_LOOP_CHUNKED           = (1ULL <<  3),
 
   BRIDGE_TYPE_LAUNCH_INIT            = (1ULL << 10), // attention! not yet implemented
   BRIDGE_TYPE_LAUNCH_LOOP            = (1ULL << 11),
@@ -531,16 +642,6 @@ typedef enum bridge_type
   BRIDGE_TYPE_REPLACE_LOOP           = (1ULL << 21),
   BRIDGE_TYPE_REPLACE_LOOP2          = (1ULL << 22),
   BRIDGE_TYPE_REPLACE_COMP           = (1ULL << 23), // attention! not yet implemented
-
-  BRIDGE_TYPE_FORCE_WORKITEMS_001    = (1ULL << 30), // This override the workitem counts reported from the bridge device
-  BRIDGE_TYPE_FORCE_WORKITEMS_002    = (1ULL << 31), // Can be useful if this is not a physical hardware
-  BRIDGE_TYPE_FORCE_WORKITEMS_004    = (1ULL << 32),
-  BRIDGE_TYPE_FORCE_WORKITEMS_008    = (1ULL << 33),
-  BRIDGE_TYPE_FORCE_WORKITEMS_016    = (1ULL << 34),
-  BRIDGE_TYPE_FORCE_WORKITEMS_032    = (1ULL << 35),
-  BRIDGE_TYPE_FORCE_WORKITEMS_064    = (1ULL << 36),
-  BRIDGE_TYPE_FORCE_WORKITEMS_128    = (1ULL << 37),
-  BRIDGE_TYPE_FORCE_WORKITEMS_256    = (1ULL << 36),
 
 } bridge_type_t;
 
@@ -685,6 +786,10 @@ typedef enum guess_mode
   GUESS_MODE_GENERIC                    = 15,
   GUESS_MODE_GENERIC_RULES_FILE         = 16,
   GUESS_MODE_GENERIC_RULES_GEN          = 17,
+  GUESS_MODE_HYBRID                     = 18,
+  GUESS_MODE_HYBRID_CS                  = 19,
+  GUESS_MODE_HYBRID_Q                   = 20,
+  GUESS_MODE_HYBRID_Q_CS                = 21,
 
 } guess_mode_t;
 
@@ -709,16 +814,15 @@ typedef enum user_options_defaults
   AUTODETECT               = false,
   BACKEND_DEVICES_VIRTMULTI = 1,
   BACKEND_DEVICES_VIRTHOST = 1,
-  BACKEND_DEVICES_KEEPFREE = 0,
   BENCHMARK_ALL            = false,
   BENCHMARK_MAX            = 99999,
   BENCHMARK_MIN            = 0,
   BENCHMARK                = false,
-  BITMAP_MAX               = 18,
-  BITMAP_MIN               = 16,
+  BITMAP_MAX               = 24,
+  BITMAP_MIN               = 10,
   #ifdef WITH_BRAIN
   BRAIN_CLIENT             = false,
-  BRAIN_CLIENT_FEATURES    = 2,
+  BRAIN_CLIENT_FEATURES    = 3,
   BRAIN_PORT               = 6863,
   BRAIN_SERVER             = false,
   BRAIN_SESSION            = 0,
@@ -785,6 +889,7 @@ typedef enum user_options_defaults
   REMOVE_TIMER             = 60,
   RESTORE_ENABLE           = true,
   RESTORE                  = false,
+  RESTORE_POSITION         = false,
   RESTORE_TIMER            = 1,
   RP_GEN                   = 0,
   RP_GEN_FUNC_MAX          = 4,
@@ -792,7 +897,6 @@ typedef enum user_options_defaults
   RP_GEN_SEED              = 0,
   RUNTIME                  = 0,
   SCRYPT_TMTO              = 0,
-  SEGMENT_SIZE             = 33554432,
   SELF_TEST                = true,
   SHOW                     = false,
   SKIP                     = 0,
@@ -801,6 +905,8 @@ typedef enum user_options_defaults
   SPIN_DAMP                = 0,
   STATUS                   = false,
   STATUS_JSON              = false,
+  PIPELINE_STATS           = false,
+  TASK_TIME_BREAKDOWN      = false,
   STATUS_TIMER             = 10,
   STDIN_TIMEOUT_ABORT      = 120,
   STDOUT_FLAG              = false,
@@ -810,7 +916,6 @@ typedef enum user_options_defaults
   VERACRYPT_PIM_START      = 485,
   VERACRYPT_PIM_STOP       = 485,
   WORDLIST_AUTOHEX         = true,
-  WORKLOAD_PROFILE         = 2,
 
 } user_options_defaults_t;
 
@@ -821,7 +926,6 @@ typedef enum user_options_map
   IDX_BACKEND_DEVICES           = 'd',
   IDX_BACKEND_DEVICES_VIRTMULTI = 'Y',
   IDX_BACKEND_DEVICES_VIRTHOST  = 'R',
-  IDX_BACKEND_DEVICES_KEEPFREE  = 0xff60,
   IDX_BACKEND_IGNORE_CUDA       = 0xff01,
   IDX_BACKEND_IGNORE_HIP        = 0xff02,
   IDX_BACKEND_IGNORE_METAL      = 0xff03,
@@ -837,6 +941,7 @@ typedef enum user_options_map
   #ifdef WITH_BRAIN
   IDX_BRAIN_CLIENT              = 'z',
   IDX_BRAIN_CLIENT_FEATURES     = 0xff09,
+  IDX_BRAIN_FEED                = 0xff17,
   IDX_BRAIN_HOST                = 0xff0a,
   IDX_BRAIN_PASSWORD            = 0xff0b,
   IDX_BRAIN_PORT                = 0xff0c,
@@ -894,6 +999,9 @@ typedef enum user_options_map
   IDX_LEFT                      = 0xff27,
   IDX_LIMIT                     = 'l',
   IDX_LOGFILE_DISABLE           = 0xff28,
+  IDX_LOOKUP                    = 0xff89,
+  IDX_PIPELINE_STATS            = 0xff8b,
+  IDX_TASK_TIME_BREAKDOWN       = 0xff8a,
   IDX_LOOPBACK                  = 0xff29,
   IDX_MACHINE_READABLE          = 0xff2a,
   IDX_MARKOV_CLASSIC            = 0xff2b,
@@ -921,6 +1029,7 @@ typedef enum user_options_map
   IDX_RESTORE                   = 0xff3c,
   IDX_RESTORE_DISABLE           = 0xff3d,
   IDX_RESTORE_FILE_PATH         = 0xff3e,
+  IDX_RESTORE_POSITION          = 0xff87,
   IDX_RP_FILE                   = 'r',
   IDX_RP_GEN_FUNC_MAX           = 0xff3f,
   IDX_RP_GEN_FUNC_MIN           = 0xff40,
@@ -931,7 +1040,7 @@ typedef enum user_options_map
   IDX_RULE_BUF_R                = 'k',
   IDX_RUNTIME                   = 0xff43,
   IDX_SCRYPT_TMTO               = 0xff44,
-  IDX_SEGMENT_SIZE              = 'c',
+  IDX_SEEKDB_PATH               = 0xff88,
   IDX_SELF_TEST_DISABLE         = 0xff45,
   IDX_SEPARATOR                 = 'p',
   IDX_SESSION                   = 0xff46,
@@ -955,6 +1064,7 @@ typedef enum user_options_map
   IDX_VERSION                   = 'V',
   IDX_WORDLIST_AUTOHEX_DISABLE  = 0xff54,
   IDX_WORKLOAD_PROFILE          = 'w',
+  IDX_ENCRYPT_WITH_PUBKEY       = 0xff70,
 
 } user_options_map_t;
 
@@ -1118,6 +1228,9 @@ typedef struct hashes
 
   int          parser_token_length_cnt;
 
+  bool         radix_deduped;
+  bool         radix_digests_reordered;
+
 } hashes_t;
 
 typedef struct hashconfig
@@ -1184,7 +1297,6 @@ typedef struct hashconfig
 
   u32 forced_outfile_format;
 
-  bool dictstat_disable;
   bool hlfmt_disable;
   bool warmup_disable;
   bool outfile_check_disable;
@@ -1214,6 +1326,53 @@ typedef struct pw_pre
 
 } pw_pre_t;
 
+// One prepared batch of candidates, and everything a launch needs to know about it. Building a batch
+// is host work and running it is device work, so they are kept apart: the buffers belong to the batch
+// rather than to the device, which is what lets the next batch be built while this one runs.
+
+#define PW_PIPE_SLOTS 2
+
+typedef struct pw_batch
+{
+  pw_idx_t *pws_idx;
+  u32      *pws_comp;
+  u64       pws_cnt;
+
+  // The device engine's cells, one per candidate in this batch. They belong to the batch for the same
+  // reason the candidates do: the next batch is built while this one runs.
+
+  pcfg_cell_t *pcfg_cells;
+
+  // and the wave map that goes with them: which cell each wave of the launch belongs to, and how many
+  // waves that comes to. It is built here, one cell at a time as the cells are, because this runs on
+  // the producer thread where the feed already runs for free. Building it on the launch thread instead
+  // cost 411 ms of every launch on an RTX 4090, against 26 ms for the copy it sits in.
+
+  u32 *pcfg_wmap;
+  u64  pcfg_waves;
+
+  // slow candidates keep the rule and the base word each candidate came from, so --debug-mode can
+  // report them. That is read while the batch runs, so it belongs to the batch too.
+
+  pw_pre_t *pws_base;
+  u64       pws_base_cnt;
+
+  // where this batch sits in the keyspace. The restore point may only advance past a batch that has
+  // actually been launched, so the figures travel with the batch instead of with the device.
+
+  u64 words_off;
+  u64 words_fin;
+  u64 words_extra;
+
+  // A rejected word of a feed that amplifies cost a whole cell rather than one candidate, and this
+  // holds what those cells came to, in candidates. The cell itself does not survive the rejection,
+  // because pws_cnt does not advance over a refused word and the next one is written at the same
+  // index, so the count is made where the word is refused rather than from a multiplier at the end.
+
+  u64 words_extra_amp;
+
+} pw_batch_t;
+
 typedef struct cpt
 {
   u32       cracked;
@@ -1233,16 +1392,44 @@ typedef struct link_speed
 
 // file handling
 
+// A gzip and an xz reader. Both are declared here and defined in filehandling.c, so that this
+// header says a handle exists without saying what a handle is. Every module, bridge and feed
+// includes this file, and none of them opens a compressed file: naming the concrete types here
+// would put the compression library's own headers on all 593 of their compile lines.
+
+typedef struct gzfile gzfile_t;
+
 typedef struct xzfile xzfile_t;
+
+typedef struct zstdfile zstdfile_t;
+
+// A file that is already in memory. It is opened over a buffer somebody else owns and holds no copy,
+// so whatever produced the buffer has to outlive the handle. That is what lets one decompressed
+// archive serve a reader per member without a copy apiece.
+
+typedef struct memfile memfile_t;
+
+// Where one frame of a compressed file ends and the next one begins.
+//
+// A container built out of independent frames can be read from any of those boundaries rather than
+// only from the start, which is what lets a compressed wordlist be seeked into. Only the file layer
+// knows where the boundaries of a given container are, so it reports them as they go past and a
+// caller that wants to come back later writes them down.
+//
+// comp_off is where the next frame starts in the file on disk. uncomp_off is how many decompressed
+// bytes came before it, so the two together say what a restart there would land on.
+
+typedef void (*hc_frame_cb_t) (void *userdata, const u64 comp_off, const u64 uncomp_off);
 
 typedef struct hc_fp
 {
   int         fd;
 
   FILE       *pfp; // plain fp
-  gzFile      gfp; //  gzip fp
-  unzFile     ufp; //   zip fp
+  gzfile_t   *gfp; //  gzip fp
   xzfile_t   *xfp; //    xz fp
+  zstdfile_t *zfp; //  zstd fp
+  memfile_t  *mfp; //  memory fp
 
   int         bom_size;
 
@@ -1261,8 +1448,33 @@ typedef struct hc_fp
 #include "ext_OpenCL.h"
 #include "ext_metal.h"
 
+// Where a launch's wall clock goes, split by the stage that spent it. A launch is a chain of host
+// steps around one device step, and the steps live in different files, so every stage books its time
+// into the device it belongs to.
+
+typedef enum pipe_slot
+{
+  PIPE_FEED   = 0,  // building the candidate batch on the host, off the critical path
+  PIPE_COPY   = 1,  // uploading it and running the decompress kernel
+  PIPE_INIT   = 2,  // amplifier, utf16 conversion and the init kernel
+  PIPE_XFER   = 3,  // tmps out to the host and back
+  PIPE_LAUNCH = 4,  // the loop itself, kernel or bridge
+  PIPE_COMP   = 5,  // the comp kernel
+
+  PIPE_SLOTS  = 6,
+
+} pipe_slot_t;
+
 typedef struct hc_device_param
 {
+  // Per device, because a device thread books only its own launches. These used to be one set of
+  // globals written by every device thread at once, which added the devices together and raced
+  // doing it.
+
+  double    pipe_msec[PIPE_SLOTS];
+  u64       pipe_launches;
+  u64       pipe_cands;
+
   int     device_id;
 
   // this occurs if the same device (pci address) is used by multiple backend API
@@ -1277,9 +1489,22 @@ typedef struct hc_device_param
   bool    skipped;              // permanent
   bool    skipped_warning;      // iteration
 
+  // Why this device is not being used, for the summary printed once enumeration is over. A device
+  // the user excluded is not a loss and leaves this empty, so what remains here is a device that was
+  // asked for and did not come up.
+
+  char    skipped_reason[64];
+
+  // Set on the other virtual devices sharing one physical device once any of them has been refused for
+  // want of memory, so the rest are not set up at a cost that only deepens the shortage.
+
+  bool    memory_hit_shared;
+
   u32     device_processors;
+  u32     device_processor_threads;          // work items one processor holds resident, 0 if the runtime cannot report it
   u64     device_maxmem_alloc;
   u64     device_global_mem;
+  u64     device_cache_size;                 // last level cache the device reports, 0 if it reports none
   u64     device_available_mem;
   int     device_host_unified_memory;
   u32     device_maxclock_frequency;
@@ -1298,6 +1523,16 @@ typedef struct hc_device_param
   u32     kernel_preferred_wgs_multiple;
 
   int     bridge_link_device;
+
+  // A copy of another device rather than a device of its own. Virtualisation makes one backend device
+  // per bridge unit, all of them the same physical device, because a unit computes but does not feed
+  // itself and needs something to generate its candidates.
+  //
+  // The first copy is left unmarked and stands for the physical device. The rest are marked here so
+  // that -I can describe the machine rather than the work: a run with 33 bridge units otherwise lists
+  // 33 identical CPUs, which reads as something being badly wrong.
+
+  bool    is_virtual;
 
   st_status_t st_status;        // selftest status
 
@@ -1441,6 +1676,14 @@ typedef struct hc_device_param
   u64  size_hooks;
   u64  size_bfs;
   u64  size_combs;
+  u64  size_combs_c;
+
+  // The device engine's two buffers. The cells are per work item and are rewritten every launch beside
+  // pws_buf; the pool is the terminal bytes every cell indexes into and is uploaded once.
+
+  u64  size_pcfg_cells;
+  u64  size_pcfg_pool;
+  u64  size_pcfg_wmap;
   u64  size_rules;
   u64  size_rules_c;
   u64  size_root_css;
@@ -1464,6 +1707,7 @@ typedef struct hc_device_param
   u64  size_brain_link_out;
 
   int           brain_link_client_fd;
+  bool          brain_link_reported;    // a failed link is retried per batch, so report an outage once
   link_speed_t  brain_link_recv_speed;
   link_speed_t  brain_link_send_speed;
   bool          brain_link_recv_active;
@@ -1476,30 +1720,63 @@ typedef struct hc_device_param
 
   char     *scratch_buf;
 
-  HCFILE    combs_fp;
   pw_t     *combs_buf;
 
+  pcfg_cell_t *pcfg_cells_buf;
+
+  // Which cell each wave of the launch belongs to. A cell takes as many waves as its rectangle needs,
+  // so a wave cannot work its own cell out from its id and this is the answer, one word a wave.
+
+  u32 *pcfg_wmap_buf;
+
+  // What the last layout of the PCFG launch came to: how many cells it covered, and how many work
+  // items those cells ask for between them. A cell takes as many work items as its rectangle needs
+  // rather than a fixed number, so the launch size cannot be worked out from the base word count and
+  // has to be read back off the plan.
+
+  u64 pcfg_lane_cnt;
+  u64 pcfg_lane_total;
+
+  // Whether combs_buf holds the amplifier chunk that is on the device. It does for every attack mode
+  // that builds the amplifier on the host, and it does not for the one -a 12 shape whose mask the mask
+  // processor produces on the device. Anything rebuilding a candidate has to know which, because in
+  // the second case the buffer holds whatever was in it last.
+
+  bool      combs_on_host;
+
   void     *hooks_buf;
+
+  // the batch currently being launched. These point into one of the slots below, so everything
+  // downstream of the launch reads them unchanged.
 
   pw_idx_t *pws_idx;
   u32      *pws_comp;
   u64       pws_cnt;
 
+  pw_batch_t pws_slot[PW_PIPE_SLOTS];
+
   pw_pre_t *pws_pre_buf;  // for slow candidates
   u64       pws_pre_cnt;
 
-  pw_pre_t *pws_base_buf; // for debug mode
-  u64       pws_base_cnt;
+  pw_pre_t *pws_base_buf; // for debug mode, a view of the batch being launched
 
   void    *h_tmps; // we need this only for bridges
 
   u64     words_off;
+
+  // Where the batch being launched starts. words_off above belongs to the producer, which is filling
+  // the next batch while this one runs, so by the time a crack is reported it has already moved on.
+  // A crack is booked at a position in the keyspace, so that position has to come from the batch and
+  // not from wherever the producer happens to have got to.
+
+  u64     words_off_launch;
+
   u64     words_done;
 
   u64     outerloop_pos;
   u64     outerloop_left;
   double  outerloop_msec;
-  double  outerloop_multi;
+  double  outerloop_words;
 
   u64     innerloop_pos;
   u64     innerloop_left;
@@ -1534,7 +1811,6 @@ typedef struct hc_device_param
 
   // Some more attributes
 
-  bool    use_opencl11;
   bool    use_opencl12;
   bool    use_opencl20;
   bool    use_opencl30;
@@ -1659,6 +1935,9 @@ typedef struct hc_device_param
   CUdeviceptr       cuda_d_rules_c;
   CUdeviceptr       cuda_d_combs;
   CUdeviceptr       cuda_d_combs_c;
+  CUdeviceptr       cuda_d_pcfg_cells;
+  CUdeviceptr       cuda_d_pcfg_pool;
+  CUdeviceptr       cuda_d_pcfg_wmap;
   CUdeviceptr       cuda_d_bfs;
   CUdeviceptr       cuda_d_bfs_c;
   CUdeviceptr       cuda_d_tm_c;
@@ -1742,6 +2021,9 @@ typedef struct hc_device_param
   hipDeviceptr_t    hip_d_rules_c;
   hipDeviceptr_t    hip_d_combs;
   hipDeviceptr_t    hip_d_combs_c;
+  hipDeviceptr_t    hip_d_pcfg_cells;
+  hipDeviceptr_t    hip_d_pcfg_pool;
+  hipDeviceptr_t    hip_d_pcfg_wmap;
   hipDeviceptr_t    hip_d_bfs;
   hipDeviceptr_t    hip_d_bfs_c;
   hipDeviceptr_t    hip_d_tm_c;
@@ -1863,6 +2145,9 @@ typedef struct hc_device_param
   mtl_mem_t         metal_d_rules_c;
   mtl_mem_t         metal_d_combs;
   mtl_mem_t         metal_d_combs_c;
+  mtl_mem_t         metal_d_pcfg_cells;
+  mtl_mem_t         metal_d_pcfg_pool;
+  mtl_mem_t         metal_d_pcfg_wmap;
   mtl_mem_t         metal_d_bfs;
   mtl_mem_t         metal_d_bfs_c;
   mtl_mem_t         metal_d_tm_c;
@@ -1909,6 +2194,14 @@ typedef struct hc_device_param
   u32               opencl_platform_id;
   cl_uint           opencl_platform_vendor_id;
 
+  // Whether the device answers cl_amd_device_attribute_query, which is where the only OpenCL query
+  // for free device memory lives. Recorded at enumeration because the extension string is not kept.
+  // Vendor id is not a substitute: Mesa's rusticl reports VENDOR_ID_AMD and answers none of these.
+
+  bool              has_amd_device_attribute_query;
+
+  mem_source_t      device_available_mem_source;
+
   cl_device_id      opencl_device;
   cl_context        opencl_context;
   cl_command_queue  opencl_command_queue;
@@ -1952,6 +2245,9 @@ typedef struct hc_device_param
   cl_mem            opencl_d_rules_c;
   cl_mem            opencl_d_combs;
   cl_mem            opencl_d_combs_c;
+  cl_mem            opencl_d_pcfg_cells;
+  cl_mem            opencl_d_pcfg_pool;
+  cl_mem            opencl_d_pcfg_wmap;
   cl_mem            opencl_d_bfs;
   cl_mem            opencl_d_bfs_c;
   cl_mem            opencl_d_tm_c;
@@ -1982,10 +2278,55 @@ typedef struct hc_device_param
   cl_mem            opencl_d_st_esalts_buf;
   cl_mem            opencl_d_kernel_param;
 
+  // Which presentation group this device belongs to, as the device index of the group's first
+  // member. A device that leads its own group carries its own index, which is what every device
+  // outside a bridge does, so nothing about an ordinary run changes.
+  //
+  // Many devices can be ONE thing the user is looking at. Grouping is how those stay separate: work
+  // is fed, tuned and failed per device, and reported per group. Without it sixty four devices of one
+  // kind are sixty four status lines saying the same number.
+
+  int               group_id;
+
+  // Whether this device's context and programs came from an earlier clone of the same physical
+  // device rather than being built here. A cl_program is what costs the host memory, and it belongs
+  // to a context, so the two are shared or neither is.
+
+  bool              opencl_context_is_clone;
+
+  // What makes two builds interchangeable. hashcat already computes these to name the kernel cache
+  // file, and a clone that agrees on both can use the program a previous clone built.
+
+  char              opencl_chksum[24];
+  char              opencl_chksum_amp_mp[24];
+
 } hc_device_param_t;
+
+// One entry per kernel binary a run has to produce. Devices that would build the same file are the
+// same class, and the file name is the class: it already carries the device, the driver, the attack
+// and a digest of the source, so two devices sharing a name would compile identical output.
+
+// shared, main, mp and amp: the four kernel binaries a device can need
+
+#define KERNEL_BUILDS_PER_DEVICE 4
+
+typedef struct kernel_build
+{
+  char cached_file[256];
+
+  bool done;
+  bool failed;
+
+} kernel_build_t;
 
 typedef struct backend_ctx
 {
+  kernel_build_t     *kernel_builds;
+  int                 kernel_builds_cnt;
+
+  hc_thread_mutex_t   mux_kernel_build;
+  hc_thread_cond_t    cond_kernel_build;
+
   bool                enabled;
 
   // global rc
@@ -2018,8 +2359,16 @@ typedef struct backend_ctx
   int                 backend_devices_cnt;
   int                 backend_devices_virtmulti;
   int                 backend_devices_virthost;
-  int                 backend_devices_keepfree;
   int                 backend_devices_active;
+
+  // The machine as the runtimes reported it, recorded before virtualization rewrites the device list.
+  // A virtualized run replaces that list with clones of one physical device, so the list can no longer
+  // answer which hardware is present, which is exactly what a message about having no usable device
+  // left has to describe. Indexed the way backend devices are numbered without virtualization, so
+  // index 0 is device #1 and is also --backend-devices-virthost=1.
+
+  int                 physical_devices_cnt;
+  cl_device_type      physical_devices_type[DEVICES_MAX];
 
   int                 cuda_devices_cnt;
   int                 cuda_devices_active;
@@ -2029,6 +2378,13 @@ typedef struct backend_ctx
   int                 metal_devices_active;
   int                 opencl_devices_cnt;
   int                 opencl_devices_active;
+
+  // Whether virtual devices on one physical device share the compiled program instead of each
+  // building their own. A program costs about 165 MiB of host memory on a runtime that compiles at
+  // startup, and that is per virtual device, so a bridge with many units pays it many times over for
+  // byte-identical builds.
+
+  bool                opencl_program_share;
 
   int                 backend_devices_filter[DEVICES_MAX];
 
@@ -2050,6 +2406,11 @@ typedef struct backend_ctx
   bool                need_iokit;
 
   int                 comptime;
+
+  // digest of every kernel source that is shared by all kernels, read once because it does not depend
+  // on the device or on the hash mode
+
+  u64                 kernel_shared_chksum;
 
   int                 force_jit_compilation;
 
@@ -2091,14 +2452,23 @@ typedef struct backend_ctx
 
 } backend_ctx_t;
 
+// KERNEL_ACCEL_MAX bounds a per-multiprocessor multiplier, which is what kernel_accel means for a
+// compute kernel: the launch is hardware_power * kernel_accel, so 1024 is already an enormous grid.
+//
+// Under an assimilation bridge hardware_power is 1 and kernel_accel IS the candidate count in a
+// launch, so the same number is a much smaller thing. A bridge whose unit is itself wide computes in
+// waves of its own width and wants many whole waves per launch, which can put its useful range in the
+// thousands, and 1024 would then express only the bottom few percent of it.
+
 typedef enum kernel_workload
 {
-  KERNEL_ACCEL_MIN   = 1,
-  KERNEL_ACCEL_MAX   = 1024,
-  KERNEL_LOOPS_MIN   = 1,
-  KERNEL_LOOPS_MAX   = 1024,
-  KERNEL_THREADS_MIN = 1,
-  KERNEL_THREADS_MAX = 1024,
+  KERNEL_ACCEL_MIN        = 1,
+  KERNEL_ACCEL_MAX        = 1024,
+  KERNEL_ACCEL_MAX_BRIDGE = 16384,
+  KERNEL_LOOPS_MIN        = 1,
+  KERNEL_LOOPS_MAX        = 1024,
+  KERNEL_THREADS_MIN      = 1,
+  KERNEL_THREADS_MAX      = 1024,
 
 } kernel_workload_t;
 
@@ -2191,19 +2561,6 @@ typedef struct debugfile_ctx
 
 } debugfile_ctx_t;
 
-typedef struct dictstat
-{
-  u64 cnt;
-
-  struct stat stat;
-
-  char encoding_from[64];
-  char encoding_to[64];
-
-  u8 hash_filename[16];
-
-} dictstat_t;
-
 typedef struct hashdump
 {
   int version;
@@ -2211,22 +2568,6 @@ typedef struct hashdump
   hashes_t hashes;
 
 } hashdump_t;
-
-typedef struct dictstat_ctx
-{
-  bool enabled;
-
-  char *filename;
-
-  dictstat_t *base;
-
-  #if defined (_WIN)
-  u32    cnt;
-  #else
-  size_t cnt;
-  #endif
-
-} dictstat_ctx_t;
 
 typedef struct loopback_ctx
 {
@@ -2246,8 +2587,34 @@ typedef struct mf
 
 } mf_t;
 
+// State for --encrypt-with-pubkey. The library handle and the key are void pointers so that no
+// OpenSSL header is needed to build hashcat; see ext_openssl.h.
+
+typedef struct pubkey_ctx
+{
+  bool    enabled;
+
+  void   *openssl;                    // hc_openssl_lib_t
+  void   *pubkey;                     // EVP_PKEY
+
+  int     key_bits;
+  size_t  key_size;
+  size_t  capacity;                   // key_size minus the OAEP overhead
+
+  char    keyid[17];                  // 16 hex characters and a terminator
+
+  u64     run_time;                   // stamped into every payload
+
+} pubkey_ctx_t;
+
 typedef struct outfile_ctx
 {
+  // How many batches are open. check_cracked () takes one for the whole of a launch's results, so
+  // the file is opened and locked once instead of once per cracked hash. Zero means the old
+  // behaviour, one open per write, which every other caller still gets.
+
+  int batch_depth;
+
   HCFILE  fp;
 
   u32     outfile_format;
@@ -2272,6 +2639,8 @@ typedef struct pot
 
 typedef struct potfile_ctx
 {
+  int batch_depth;
+
   HCFILE   fp;
 
   bool     enabled;
@@ -2306,6 +2675,13 @@ typedef struct pot_tree_entry
   // we compare the correct dgst_pos0...dgst_pos3
 
   hashconfig_t *hashconfig;
+
+  // The password the potfile has for this hash+salt, kept here rather than pushed straight into the
+  // linked list, because a potfile with the same hash on many lines would otherwise walk the whole
+  // list once per line. It is handed to the nodes once, after the potfile has been read.
+
+  char *pw_buf;
+  int   pw_len;
 
 } pot_tree_entry_t;
 
@@ -2344,6 +2720,12 @@ typedef struct restore_ctx
 
   bool    restore_execute;
 
+  // Set when --restore has printed the command line the restore file holds and the run must stop
+  // there. hashcat_session_init returns as soon as it sees this, before anything has opened a file
+  // or created a directory on the strength of what the restore file said.
+
+  bool    print_only;
+
   int     argc;
   char  **argv;
 
@@ -2369,12 +2751,19 @@ typedef struct pidfile_ctx
 
 } pidfile_ctx_t;
 
+// --stdout writes one syscall per full buffer, and at HCBUFSIZ_SMALL that is a write() every few
+// hundred candidates. The buffer is a local in process_stdout (), so this stays a size a thread
+// stack carries comfortably.
+
+#define STDOUT_BUFSIZ 0x10000
+
 typedef struct out
 {
   HCFILE fp;
 
-  char   buf[HCBUFSIZ_SMALL];
+  char   buf[STDOUT_BUFSIZ];
   int    len;
+  bool   write_failed;
 
 } out_t;
 
@@ -2388,9 +2777,8 @@ typedef struct tuning_db_alias
 typedef struct tuning_db_entry
 {
   const char *device_name;
-  int         attack_mode;
+  int         attack_kern;
   int         hash_mode;
-  int         workload_profile;
   int         vector_width;
   int         kernel_accel;
   int         kernel_loops;
@@ -2412,24 +2800,6 @@ typedef struct tuning_db
 
 } tuning_db_t;
 
-typedef struct wl_data
-{
-  bool enabled;
-
-  char *buf;
-  u64  incr;
-  u64  avail;
-  u64  cnt;
-  u64  pos;
-
-  bool    iconv_enabled;
-  iconv_t iconv_ctx;
-  char   *iconv_tmp;
-
-  void (*func) (char *, u64, u64 *, u64 *);
-
-} wl_data_t;
-
 typedef struct user_options
 {
   const char  *hc_bin;
@@ -2437,9 +2807,15 @@ typedef struct user_options
   int          hc_argc;
   char       **hc_argv;
 
+  // The vector the attack mode alias built, kept only so that it can be freed. hc_argv points at it
+  // while the alias is in force and at argv otherwise, so it cannot be freed through hc_argv.
+
+  char       **hc_argv_alias;
+
   bool         attack_mode_chgd;
   bool         autodetect;
   #ifdef WITH_BRAIN
+  bool         brain_client_features_chgd;
   bool         brain_host_chgd;
   bool         brain_port_chgd;
   bool         brain_password_chgd;
@@ -2464,8 +2840,6 @@ typedef struct user_options
   bool         rp_gen_seed_chgd;
   bool         runtime_chgd;
   bool         metal_compiler_runtime_chgd;
-  bool         segment_size_chgd;
-  bool         workload_profile_chgd;
   bool         skip_chgd;
   bool         limit_chgd;
   bool         scrypt_tmto_chgd;
@@ -2479,6 +2853,7 @@ typedef struct user_options
   bool         benchmark_all;
   #ifdef WITH_BRAIN
   bool         brain_client;
+  bool         brain_feed;
   bool         brain_server;
   #endif
   bool         color_cracked;
@@ -2514,12 +2889,15 @@ typedef struct user_options
   bool         remove;
   bool         restore;
   bool         restore_enable;
+  bool         restore_position;
   bool         self_test;
   bool         show;
   bool         slow_candidates;
   bool         speed_only;
   bool         status;
   bool         status_json;
+  bool         pipeline_stats;
+  bool         task_time_breakdown;
   bool         stdout_flag;
   bool         stdin_timeout_abort_chgd;
   bool         username;
@@ -2540,6 +2918,8 @@ typedef struct user_options
   char        *debug_file;
   char        *induction_dir;
   char        *keyboard_layout_mapping;
+  char        *lookup;
+  char        *lookup_alias;    // "lookup=" plus the above, when -a 4 is handed the question
   char        *markov_hcstat2;
   char        *backend_devices;
   char        *opencl_device_types;
@@ -2549,6 +2929,7 @@ typedef struct user_options
   char        *restore_file_path;
   char       **rp_files;
   char        *rp_gen_func_sel;
+  char        *seekdb_path;
   char        *separator;
   char        *truecrypt_keyfiles;
   char        *veracrypt_keyfiles;
@@ -2565,10 +2946,22 @@ typedef struct user_options
   const char  *rule_buf_l;
   const char  *rule_buf_r;
   const char  *session;
+  char        *encrypt_with_pubkey;
   u32          attack_mode;
+
+  // The attack mode the user asked for, which is not always the one the run uses. -a 1, -a 6 and
+  // -a 7 are rewritten into -a 12 masks at startup, so everything below the rewrite sees -a 12, and
+  // the few things that have to answer for what was typed read this instead.
+
+  u32          attack_mode_typed;
+
+  // Where that rewrite puts the ?w marker on each mask. It is also what says a mask came from an
+  // aliased mode rather than from the user.
+
+  u32          marker_policy;
+
   u32          backend_devices_virtmulti;
   u32          backend_devices_virthost;
-  u32          backend_devices_keepfree;
   u32          backend_info;
   u32          benchmark_max;
   u32          benchmark_min;
@@ -2610,13 +3003,11 @@ typedef struct user_options
   u32          runtime;
   u32          metal_compiler_runtime;
   u32          scrypt_tmto;
-  u32          segment_size;
   u32          status_timer;
   u32          stdin_timeout_abort;
   u32          usage;
   u32          veracrypt_pim_start;
   u32          veracrypt_pim_stop;
-  u32          workload_profile;
   u64          limit;
   u64          skip;
   bool         hash_copy;
@@ -2630,14 +3021,48 @@ typedef struct user_options_extra
   u32 rule_len_r;
   u32 rule_len_l;
 
+  // Which of -j and -k applies to the base word and which to the amplifier. That is not the same
+  // question as which flag the user typed. -j is the rule for the left hand side of a candidate and -k
+  // for the right, but which side the base loop walks depends on the attack mode: -a 7 builds mask plus
+  // word, so its word is the right hand side, and -a 1 takes whichever of its two dictionaries is
+  // larger as the base.
+  //
+  // Resolving it once here is what lets combinator_ctx_init stop swapping the user's own options in
+  // place, and what takes the -a 7 special case out of every producer that reads a base word.
+
+  const char *rule_buf_base;
+  const char *rule_buf_amp;
+
+  u32 rule_len_base;
+  u32 rule_len_amp;
+
+  u32 base_source;
+  u32 base_scope;
   u32 wordlist_mode;
+
+  // Whether the last work argument is the wordlist a ?q names. A -a 12 the user typed says so with a
+  // third argument, a -a 1 rewritten into one always has one, and a -a 6 rewritten into one never
+  // does and may have any number of base wordlists, so the count alone cannot answer it.
+
+  bool hybrid_q;
 
   char   separator;
 
   char  *hc_hash;   // can be filename or string
 
+  // --dynamic-x: the number in the $dynamic_N$ tag of the first hash. One hash list is one -m, so
+  // every other line has to carry the same number, and this is what they are compared against.
+
+  int    dynamicx_num;
+
   int    hc_workc;  // can be 0 in bf-mode = default mask
   char **hc_workv;
+
+  // -a 9 given nothing but a hash file splits that file itself: on each line the text before the first
+  // separator is the candidate and the rest is the hash. That is the same pairing the two argument form
+  // makes, with the wordlist taken out of the hash file instead of out of a second file.
+
+  bool   association_autosplit;
 
 } user_options_extra_t;
 
@@ -2656,8 +3081,6 @@ typedef struct bitmap_ctx
   u32   bitmap_nums;
   u32   bitmap_size;
   u32   bitmap_mask;
-  u32   bitmap_shift1;
-  u32   bitmap_shift2;
 
   u32  *bitmap_s1_a;
   u32  *bitmap_s1_b;
@@ -2722,13 +3145,126 @@ typedef struct combinator_ctx
 {
   bool enabled;
 
-  char *dict1;
-  char *dict2;
+  // Whether the two feed instances were swapped so that the bigger wordlist is the base word source.
+  // Only a mask that is two wordlists and nothing else can be swapped, and the amplifier then goes in
+  // front of the base word rather than behind it, so that the candidate is still the first wordlist's
+  // word followed by the second's.
+
+  bool roles_swapped;
 
   u32 combs_mode;
   u64 combs_cnt;
 
 } combinator_ctx_t;
+
+// Why a mask did not reach the candidate --lookup asked about. Which of the three it is decides what
+// the user can do about it, so they are kept apart rather than reported as one refusal.
+
+typedef enum mask_lookup_miss
+{
+  MASK_LOOKUP_MISS_NONE    = 0,
+  MASK_LOOKUP_MISS_LENGTH  = 1,  // the mask is not the candidate's length, so no offset in it can be
+  MASK_LOOKUP_MISS_CHARSET = 2,  // the mask does not allow that character at that position
+  MASK_LOOKUP_MISS_MARKOV  = 3,  // the mask allows it, and --markov-threshold dropped it from the table
+
+} mask_lookup_miss_t;
+
+// Where the queue of masks reaches the candidate --lookup asked about, filled in one round at a time
+// and read once the queue has been walked.
+//
+// word is a position in the whole queue and not in the round that found it, because that is what
+// --skip addresses. A hit is kept and later rounds cannot displace it: the queue is walked in the
+// order the run would walk it, so the first round that reaches the candidate is where the run does.
+//
+// The masks are copied rather than pointed at. A mask file's line is parsed into mask_ctx->mfs,
+// which the next round overwrites, so a pointer would still be readable and would no longer say
+// what it said when the answer was found.
+//
+// A miss is kept only until a nearer one turns up. Nearer means the mask was the right length when
+// the one before it was not, and failing that means it got further along the candidate before
+// refusing it. That is the mask the user most likely meant, and it is the one worth naming out of a
+// queue that can hold fifty.
+
+typedef struct mask_lookup
+{
+  bool  hit;
+  bool  placed;     // whether word has been moved from this round's numbering to the queue's
+
+  // A mode that hashes the candidate in upper case has every mask charset built in upper case, so
+  // the candidate is folded the same way before it is looked for and the user is told it was. What
+  // the run reaches is the folded spelling, and saying so is the difference between an answer and a
+  // wrong one.
+
+  bool  uppered;
+
+  u32   round;      // masks_pos of the round that reached it
+  char  mask[0x400]; // as wide as mf_t's, so no mask a maskfile can hold is truncated
+
+  u64   word;       // the -s value, counted from the start of the queue
+  u64   amp;        // where in that base word's cell the candidate sits
+  u64   amp_cnt;    // how wide the cell is, which is 1 when -s counts candidates
+
+  // Whether the engine this run did not get would have reached it, and whether that was asked at
+  // all. The two engines differ: the run walks a mask in two pieces and -S walks it in one, and
+  // under --markov-threshold that is not a reordering but a different set of candidates.
+  //
+  // Both directions are worth saying and both happen. A user told only that the mask does not
+  // produce their password would change the mask, when what they needed was -S. And a user handed an
+  // offset who then adds -S for a slow hash would lose the candidate without being told.
+
+  bool  other_probed;
+  bool  other;
+
+  // Masks the run passed over for being outside the mode's password length. They are not part of the
+  // attack and not part of the keyspace, so an answer that does not mention them can read as "no mask
+  // was that long" when one was and the run declined it.
+
+  u32   skipped;
+
+  mask_lookup_miss_t miss;
+
+  u32   round_miss;
+  char  mask_miss[0x400];
+  u32   miss_pos;   // the position that refused it, counted in characters and from 1
+  u32   miss_chr;   // the character it refused
+
+} mask_lookup_t;
+
+// Where a hybrid queue reaches the candidate --lookup asked about. Separate from mask_lookup_t
+// because the two answers are different shapes: -a 3 names one mask offset, and a hybrid names a
+// word, a second word and a mask offset, plus the split of the candidate that produced them.
+
+typedef struct combi_lookup
+{
+  bool  hit;
+  bool  placed;
+
+  // The mirror shape, where the mask is the base word and the dictionary amplifies it. It is a
+  // different decomposition and this does not invert it, so it is reported as unanswered rather than
+  // answered wrongly.
+
+  bool  unsupported;
+
+  u32   round;
+  char  mask[0x400];
+
+  u64   word;       // the -s value, counted from the start of the queue
+  u64   amp;        // where in that base word's cell the candidate sits
+  u64   amp_cnt;    // how wide the cell is
+
+  bool  mask_base;  // the mask is the base word and the wordlist amplifies it
+
+  u32   base_len;   // how the candidate was split between the two words
+  u32   q_len;
+  bool  has_q;
+
+  mask_lookup_miss_t miss;
+
+  char  mask_miss[0x400];
+  u32   miss_pos;
+  u32   miss_chr;
+
+} combi_lookup_t;
 
 typedef struct mask_ctx
 {
@@ -2742,6 +3278,20 @@ typedef struct mask_ctx
   cs_t  *css_buf;
   u32    css_cnt;
 
+  // Where the word markers sit in the mask, counted in css entries, which is the same as bytes because
+  // every css entry produces exactly one character. css_buf holds the mask with the markers removed,
+  // so the three mask pieces are the entries below pre_len, the mid_len entries after those, and
+  // whatever is left. Every one of the three is allowed to be empty, and so is ?q.
+  //
+  //   ?d?w?d?q?d   pre_len 1, mid_len 1, has_q true,  one entry left over for the piece at the end
+  //   ?w?d?d       pre_len 0, mid_len 0, has_q false, two entries left over
+  //   ?w?q         pre_len 0, mid_len 0, has_q true,  nothing left over, which is -a 1
+
+  bool   has_w;
+  bool   has_q;
+  u32    pre_len;
+  u32    mid_len;
+
   hcstat_table_t *root_table_buf;
   hcstat_table_t *markov_table_buf;
 
@@ -2749,6 +3299,12 @@ typedef struct mask_ctx
   cs_t  *markov_css_buf;
 
   bool   mask_from_file;
+
+  // Whether any mask in this run puts the base word inside the amplifier rather than at one end of
+  // it. The kernels compile the five piece assembly in only when it does, and it goes into the kernel
+  // cache key, so two runs that build different source out of one file cannot share a cached result.
+
+  bool   needs_middle;
 
   char **masks;
   u32    masks_pos;
@@ -2758,6 +3314,14 @@ typedef struct mask_ctx
   char  *mask;
 
   mf_t  *mfs;
+
+  // --lookup asks where this queue of masks reaches one candidate. It is answered while the queue is
+  // sized rather than by a second walk of it, because a round's tables only exist between
+  // mask_ctx_update_loop () building them and the next round overwriting them.
+
+  mask_lookup_t lookup;
+
+  combi_lookup_t lookup_combi;
 
 } mask_ctx_t;
 
@@ -2771,6 +3335,99 @@ typedef struct generic_global_ctx
   char  *profile_dir;
   char  *cache_dir;
 
+  // Where seek databases live, when the user named a directory with --seekdb-path. NULL means the
+  // feed picks its own place under cache_dir, which is what happens without the option.
+  //
+  // It is here because a database is described entirely by the wordlist it was built from, so one
+  // built on any machine is usable on every machine that reads the same file, and pointing a whole
+  // cluster at one shared directory turns a build per machine into a build for all of them. The
+  // directory may be read only: a feed writes only when it did not find what it needed, and a write
+  // that fails leaves it running from the database it just built in memory.
+
+  char  *seekdb_dir;
+
+  // Where hashcat keeps the files it ships. A feed that carries data of its own finds it here, the
+  // same way the frontend finds the feed itself: shared_dir/feeds is what was searched to load this
+  // plugin, so shared_dir/<something> is where anything shipped beside it lives.
+
+  char  *shared_dir;
+
+  // What the status display puts inside "Guess.Base.......: Feed (...)". A feed may write its own
+  // during global_init (), because the plugin name alone says what is generating and not what it is
+  // generating from: "Feed (rockyou.pcfg)" tells the user something that "Feed (pcfg)" does not.
+  // Left empty, hashcat falls back to the plugin name.
+
+  char   guess_base[256];
+
+  // A feed built from several named sources laid end to end can publish where each one begins in the
+  // keyspace, and then the status line says which source the run has reached rather than naming only
+  // the first one. segment_first[i] is the offset source i starts at, ascending.
+  //
+  // hashcat reports the source holding the restore point, which is the contiguous prefix every device
+  // has finished. Asking a device where it is would give a different answer per device and flicker
+  // between them, because the whole point of the feed is that devices work separate ranges at once.
+  //
+  // A feed with nothing to segment leaves segments_cnt at zero and keeps guess_base as it is.
+
+  u64          segments_cnt;
+  const char **segment_names;
+  const u64   *segment_first;
+
+  // What this feed reads from, as one number, so that something which has to tell two runs apart can
+  // do it without knowing what a source is. A path is not enough: the same path holds different words
+  // on different days, and a run over the new contents is a different attack from a run over the old.
+  //
+  // The brain is what needs it. It keys its record of covered keyspace on the attack, so a feed whose
+  // inputs changed has to look like a different attack or the second run is told the first one already
+  // covered it.
+  //
+  // A feed that cannot say leaves it at zero, which is what a pipe does: there is nothing to identify
+  // until it has been read, and by then it is too late to be worth saying.
+
+  u64 source_ident;
+
+  // How many candidates the device engine produces over the whole keyspace, where the feed can say.
+  //
+  // The keyspace a feed reports is base words, and the number of candidates is that times the mean
+  // cell. The mean is an integer and the true one is not, so multiplying the two is short of the truth
+  // by whatever the mean lost to rounding, and the total a run is measured against is short with it.
+  // A feed that already knows the exact number says it here and the multiplication is not used.
+  //
+  // Zero means the feed did not say, and the mean stands.
+
+  u64 dev_total;
+
+  // Whether this instance's device engine is going to be used, settled before global_init () runs so that
+  // a feed which can generate two different ways knows which one it is being loaded for.
+  //
+  // A feed that advertises GENERIC_PLUGIN_OPTIONS_DEVICE does not always get to amplify: an
+  // outside-kernel hash mode has no attack kernel to put an inner loop in, and the device engine instance
+  // of a combinator attack is a second word list rather than an device engine. hashcat settles all of that
+  // in generic_instance_init (), and a feed reads the answer here instead of working it out again from
+  // the hashconfig, which is what would let the two drift apart.
+  //
+  // It matters because the device engine is a constraint, not a feature. A feed may have parts of its
+  // model that only a host loop can carry, and those parts change the keyspace, so it has to know
+  // before it counts itself. false for every feed that never runs on the device.
+
+  bool dev_enable;
+
+  // Whether this feed was asked to describe the attack rather than to run it, which it says by
+  // setting this from global_init () or global_dev_init (). A feed's settings can carry a question,
+  // such as where in the keyspace this attack reaches a given candidate, and an answer to that is
+  // only worth anything when it comes from the tables the run itself would enumerate, under the
+  // engine the run itself was given. That is why such a question is answered from inside the feed
+  // rather than by a second program that has to be kept in step with it.
+  //
+  // The feed has already said its piece by the time hashcat reads this, on its own account and in
+  // its own words. Nothing will read a candidate from it afterwards: no device thread is started,
+  // the queue of rounds is never entered, and the run ends as a success.
+  //
+  // A feed must not exit the process itself. It is a shared object inside a session that has a
+  // potfile open and a restore file to unlink, and half of that is hashcat's to close.
+
+  bool described;
+
   bool   error;
   char   error_msg[256];
 
@@ -2780,6 +3437,21 @@ typedef struct generic_global_ctx
 
 typedef struct generic_thread_ctx
 {
+  // A failure inside thread_init (), thread_term (), thread_next () or thread_seek () is reported
+  // here and not in the global context, because those four run on one device thread each and a
+  // shared flag would let one device's failure speak for all of them.
+
+  bool   error;
+  char   error_msg[256];
+
+  // Which backend device this thread feeds. hashcat keeps one of these per device and hands each
+  // device its own, so a feed that only produces candidates never needs to know. One that wants to
+  // do work on the same device it feeds does: it is the index into backend_ctx->devices_param, and
+  // with the hashcat_ctx a feed is given in global_init () that is enough to reach the device
+  // itself. Set before thread_init () is called, and left alone afterwards.
+
+  int    device_id;
+
   void  *thrdata; // super generic
 
 } generic_thread_ctx_t;
@@ -2790,8 +3462,27 @@ typedef u64  (*GENERIC_GLOBAL_KEYSPACE) (generic_global_ctx_t *, generic_thread_
 
 typedef bool (*GENERIC_THREAD_INIT)     (generic_global_ctx_t *, generic_thread_ctx_t *);
 typedef void (*GENERIC_THREAD_TERM)     (generic_global_ctx_t *, generic_thread_ctx_t *);
-typedef int  (*GENERIC_THREAD_NEXT)     (generic_global_ctx_t *, generic_thread_ctx_t *, u8 *);
+typedef int  (*GENERIC_THREAD_NEXT)     (generic_global_ctx_t *, generic_thread_ctx_t *, u8 *, const int);
+typedef int  (*GENERIC_THREAD_NEXT_DEV) (generic_global_ctx_t *, generic_thread_ctx_t *, u8 *, const int, pcfg_cell_t *);
 typedef bool (*GENERIC_THREAD_SEEK)     (generic_global_ctx_t *, generic_thread_ctx_t *, const u64);
+typedef bool (*GENERIC_GLOBAL_DEV_INIT) (generic_global_ctx_t *, const u32 **, u64 *, u32 *, u32 *, u32 *, u32 *, u32 *, u32 *, pcfg_cell_t *);
+
+// What a live feed instance is for. A run can hold one of each, and that is what lets -a 1 be
+// expressed without a second reader: its amplifier is a wordlist too, so the number of amplifier
+// words is a feed's keyspace like any other.
+//
+// The roles are slots and not identities. -a 1 cannot say which of its two dictionaries is the base
+// until both have been counted, so the instances are created in the order the dictionaries were
+// typed and combinator_ctx_init puts them in the right slots afterwards.
+
+typedef enum generic_role
+{
+  GENERIC_ROLE_BASE = 0,
+  GENERIC_ROLE_AMP  = 1,
+
+  GENERIC_ROLE_CNT  = 2,
+
+} generic_role_t;
 
 typedef struct generic_ctx
 {
@@ -2800,7 +3491,24 @@ typedef struct generic_ctx
   generic_global_ctx_t  global_ctx;
   generic_thread_ctx_t *thread_ctx;
 
+  // what the user asked for, and the file that turned out to be
+
+  char *plugin_name;
   char *dynlib_filename;
+
+  // What the feed reads from. This is not the command line: -a 8 names its plugin as the first work
+  // argument and the rest belong to the feed, while -a 0 names no plugin at all and every work
+  // argument is a wordlist. Resolving it per attack mode is the only place that has to know, so the
+  // work arguments themselves stay exactly as the user typed them.
+
+  int    workc;
+  char **workv;
+
+  // -a 8 is handed the command line as it stands, so workv points into it. Every other mode needs a
+  // plugin name put in front of its dictionaries and gets an array of its own, which is the only case
+  // with anything to free.
+
+  bool workv_owned;
 
   hc_dynlib_t lib;
 
@@ -2813,9 +3521,62 @@ typedef struct generic_ctx
   GENERIC_THREAD_NEXT      thread_next;
   GENERIC_THREAD_SEEK      thread_seek;
 
+  // The device engine half of the interface, and it is optional. A feed that advertises
+  // GENERIC_PLUGIN_OPTIONS_DEVICE can hand hashcat a base candidate plus the cell that says how the
+  // device is to extend it, instead of one finished candidate per call. Everything else about the
+  // feed is unchanged, because the device engine is a second consumer of the same generator rather than
+  // a different generator.
+
+  GENERIC_GLOBAL_DEV_INIT  global_dev_init;
+  GENERIC_THREAD_NEXT_DEV  thread_next_dev;
+
   bool autohex_enable;
   bool iconv_enable;
   bool rules_enable;
+  bool dev_enable;
+
+  // What global_dev_init () handed over: the terminal pool every cell indexes into, and how wide the
+  // device side inner loop is. The pool is read only and uploaded once per device.
+
+  const u32 *dev_pool;
+  u64        dev_pool_size;
+  u32        dev_il_cnt;
+
+  // How many words the kernel gives a candidate. The feed settles it from the ruleset and the backend
+  // compiles the kernel with it, so the two cannot disagree unless a cached kernel is reused across
+  // rulesets, which is why it is folded into the cache key.
+
+  u32        dev_maxword;
+
+  // Whether a bucket may hold entries of more than one byte length. Settled the same way and folded
+  // into the same cache key, because it changes the kernel's source just as much.
+
+  u32        dev_varlen;
+
+  // A cell the feed really emitted, for the autotuner to probe the accel with. See global_dev_init ().
+
+  pcfg_cell_t dev_probe;
+
+  // The mean rectangle at the front of the stream, which is what the first launches carry and
+  // therefore what the autotuner has to probe with. dev_avg is the average over the whole keyspace and
+  // is what speed and progress are counted in; the two are not the same number.
+
+  u32        dev_front;
+
+  // What one step of the inner loop rewrites, in bytes. The autotuner's probe cell is one slot and this
+  // is how wide to make it, so the probe pays for a step what a real cell pays.
+
+  u32        dev_step;
+
+  // the mean rectangle. What a base word is worth, as opposed to what the inner loop may reach.
+
+  u32        dev_avg;
+
+  // What the feed said its keyspace is, in base words, before any amplifier is applied. It cannot be
+  // finished here: -a 6 and -a 7 amplify with the mask, and the mask is only sized once per round, in
+  // mask_ctx_update_loop. So the number is kept and straight_ctx_update_loop finishes it.
+
+  u64 keyspace;
 
 } generic_ctx_t;
 
@@ -2834,6 +3595,13 @@ typedef struct device_info
 {
   bool    skipped_dev;
   bool    skipped_warning_dev;
+
+  // Which group reports for this device, as the index of the group's first member, and how many
+  // devices that group holds. A device that leads its own group carries its own index and a size of
+  // 1, which is every device outside a bridge.
+
+  int     group_id_dev;
+  int     group_size_dev;
   double  hashes_msec_dev;
   double  hashes_msec_dev_benchmark;
   double  exec_msec_dev;
@@ -2851,6 +3619,7 @@ typedef struct device_info
   int     kernel_loops_dev;
   int     kernel_threads_dev;
   int     vector_width_dev;
+  u64     kernel_power_dev;
   int     salt_pos_dev;
   u64     innerloop_pos_dev;
   u64     innerloop_left_dev;
@@ -2881,6 +3650,11 @@ typedef struct hashcat_status
   int         guess_base_count;
   double      guess_base_percent;
   char       *guess_mod;
+
+  // The wordlist a ?q names. Guess.Mod is the mask for -a 12 and the mask does not say which wordlist
+  // the ?q reads, so it is carried beside it rather than folded into it.
+
+  char       *guess_mod_q;
   int         guess_mod_offset;
   int         guess_mod_count;
   double      guess_mod_percent;
@@ -2922,6 +3696,10 @@ typedef struct hashcat_status
   u64         progress_ignore;
   u64         progress_rejected;
   double      progress_rejected_percent;
+  #ifdef WITH_BRAIN
+  u64         brain_rejects_attacks;
+  u64         brain_rejects_hashes;
+  #endif
   u64         progress_restored;
   u64         progress_skip;
   u64         restore_point;
@@ -2938,6 +3716,11 @@ typedef struct hashcat_status
   device_info_t device_info_buf[DEVICES_MAX];
   int           device_info_cnt;
   int           device_info_active;
+
+  // How many groups are actually running. The status view prints one line per group, so this is what
+  // decides whether a total line underneath would say anything the lines above did not.
+
+  int           group_info_active;
 
   double  hashes_msec_all;
   double  exec_msec_all;
@@ -2975,6 +3758,16 @@ typedef struct status_ctx
   bool shutdown_outer;
 
   bool checkpoint_shutdown;
+
+  // Set once a cracking thread has actually left its loop for the checkpoint. A thread that has gone
+  // cannot be brought back, so from that point the checkpoint is happening whether or not the user
+  // changes their mind, and the run has to be ended as a checkpoint rather than as an exhausted
+  // round. Without this a cancel that lands too late cleared checkpoint_shutdown, the wait returned
+  // with the status still RUNNING, and the round was booked as EXHAUSTED: the rest of the dictionary
+  // was never dispatched and the restore file was deleted.
+
+  bool checkpoint_taken;
+
   bool finish_shutdown;
 
   hc_thread_mutex_t mux_dispatcher;
@@ -2992,6 +3785,47 @@ typedef struct status_ctx
   u64  words_base;              // the unamplified max keyspace
   u64  words_cnt;               // the amplified max keyspace
 
+  // What the producer of this round knows its unamplified keyspace to be.
+  //
+  // words_base is otherwise recovered by dividing words_cnt by the amplifier, which is exact only
+  // while the product is. A base large enough that base times amplifier does not fit in 64 bits is
+  // reachable from a feed that generates its base words rather than reading them, and there the
+  // division recovers the wrong number from a saturated product. A producer that knows the base says
+  // so here and the division is not consulted. Zero means it did not, which is every mask.
+
+  u64  words_base_given;
+
+  // -i and a mask file are a queue of rounds, and the queue is one keyspace. --skip and --limit
+  // address the queue, so each round takes its own share of that window rather than applying the
+  // whole of it again, which is what made --skip reach only the first round. These two are how far
+  // into the queue the rounds before this one already got, unamplified and amplified, and --keyspace
+  // is what they are for once the queue has been walked.
+
+  u64  words_walk_base;
+  u64  words_walk_cnt;
+
+  // This round's share of the window, both positions in the round's own keyspace. words_limit is
+  // zero when the round runs to its own end, which is what --limit not being given means.
+
+  u64  words_skip;
+  u64  words_limit;
+
+  // Where a seek is taking the run, once the devices it stopped have wound down. Only the position is
+  // kept, because everything the run counts is a function of it and seek_apply () writes the rest
+  // from the position alone.
+
+  bool seek_pending;
+  u64  seek_target;
+
+  // How far the next press of a seek key moves, which way the run of presses is going, and when the
+  // last one arrived. A held key repeats and each repeat moves further than the last, so one press
+  // stays a nudge while a hold crosses the keyspace. The step is a real number because it starts well
+  // below a percent of a large keyspace and grows by a ratio.
+
+  double     seek_step;
+  int        seek_dir;
+  hc_timer_t seek_timer;
+
   /**
    * progress
    */
@@ -3000,6 +3834,16 @@ typedef struct status_ctx
   u64 *words_progress_rejected; // progress number of words rejected per salt
   u64 *words_progress_restored; // progress number of words restored per salt
 
+  #ifdef WITH_BRAIN
+  // words_progress_rejected mixes every reason a candidate was dropped, so it cannot answer "how much
+  // did the brain save". These two count only the brain, split by mechanism, because the mechanisms
+  // are independent: ATTACKS skips a keyspace position another client already reserved, HASHES drops
+  // a candidate the brain has seen before whatever position it came from.
+
+  u64 brain_rejects_attacks;
+  u64 brain_rejects_hashes;
+  #endif
+
   int bypass_digests_done_new;  // --bypass-threshold cracked counter
 
   /**
@@ -3007,6 +3851,11 @@ typedef struct status_ctx
    */
 
   time_t runtime_start;
+
+  // Signed, so one key covers both directions. Added to the --runtime deadline the same way the
+  // paused time is, and written by the key thread while the monitor reads it.
+
+  int    runtime_adjust_sec;
   time_t runtime_stop;
 
   time_t timer_bypass_start;
@@ -3067,27 +3916,42 @@ typedef struct hashlist_parse
 
 } hashlist_parse_t;
 
-#define MAX_OLD_EVENTS 10
-
 typedef struct event_ctx
 {
-  char   old_buf[MAX_OLD_EVENTS][HCBUFSIZ_LARGE];
-  size_t old_len[MAX_OLD_EVENTS];
-  int    old_cnt;
-
   char   msg_buf[HCBUFSIZ_LARGE];
   size_t msg_len;
   bool   msg_newline;
 
   size_t prev_len;
 
+  // How many lines have been logged, and whether the last of them was a blank one. They exist so
+  // that a caller who brackets somebody else's output can tell whether there was any and whether it
+  // already ended in a separator. Neither is a question prev_len can answer: prev_len says whether
+  // the last line ended in a newline, and the bracket's own closing line always dirties it.
+
+  u64    log_cnt;
+  bool   log_blank;
+
   hc_thread_mutex_t mux_event;
+
+  // msg_buf below is one buffer shared by every caller, and a log event deliberately does not take
+  // mux_event: handlers that run with mux_event held log from inside it, so reusing that lock would
+  // deadlock. This one covers the buffer and the emission that reads it, and nothing held while it
+  // is taken ever waits on it, so the two cannot form a cycle.
+
+  hc_thread_mutex_t mux_log;
 
 } event_ctx_t;
 
 #define BRIDGE_DEFAULT (void *) -1
 
 typedef void (*BRIDGE_INIT) (void *);
+
+// Declared ahead of bridge_ctx because platform_init takes one, and the definition comes further
+// down this file. A bridge is handed the whole context rather than a few pieces of it, which is what
+// lets it call hashcat's own logging functions with no wrapper of any kind.
+
+typedef struct hashcat_ctx hashcat_ctx_t;
 
 typedef struct bridge_ctx
 {
@@ -3108,24 +3972,112 @@ typedef struct bridge_ctx
 
   // functions
 
-  void     *(*platform_init)      (user_options_t *);
-  void      (*platform_term)      (void *);
+  void     *(*platform_init)      (hashcat_ctx_t *);
+  void      (*platform_term)      (hashcat_ctx_t *, void *);
 
-  int       (*get_unit_count)     (void *);
-  char     *(*get_unit_info)      (void *, const int);
-  int       (*get_workitem_count) (void *, const int);
+  int       (*get_unit_count)        (hashcat_ctx_t *, void *);
+  char     *(*get_unit_info)         (hashcat_ctx_t *, void *, const int);
+  int       (*get_workitem_count)    (hashcat_ctx_t *, void *, const int);
+  int       (*get_workitem_multiple) (hashcat_ctx_t *, void *, const int);
 
-  bool      (*salt_prepare)       (void *, hashconfig_t *, hashes_t *);
-  void      (*salt_destroy)       (void *, hashconfig_t *, hashes_t *);
+  // Which units are interchangeable, for anything that wants to treat one unit's answer as valid for
+  // another. Two units share a class when the same tuning is right for both.
+  //
+  // OPTIONAL. Leave it unset and units are compared by get_unit_info instead, which is correct
+  // whenever a bridge's units are genuinely identical, and that is the usual case for a bridge whose
+  // units are CPU threads. A bridge whose unit info names the individual device, by carrying its
+  // device node for instance, has to answer this or no two of its units will ever look alike.
+  //
+  // It describes the CLASS, never the instance: same board, same design, same width, same clock. It
+  // must not carry a serial number, a device path or an index.
 
-  bool      (*thread_init)        (void *, hc_device_param_t *, hashconfig_t *, hashes_t *);
-  void      (*thread_term)        (void *, hc_device_param_t *, hashconfig_t *, hashes_t *);
+  char     *(*get_unit_class)        (hashcat_ctx_t *, void *, const int);
 
-  bool      (*launch_loop)        (void *, hc_device_param_t *, hashconfig_t *, hashes_t *, const u32, const u64);
-  bool      (*launch_loop2)       (void *, hc_device_param_t *, hashconfig_t *, hashes_t *, const u32, const u64);
+  // What one unit is MADE OF, for a bridge whose unit is several pieces of hardware driven together.
+  //
+  // OPTIONAL, and a bridge whose units are single things leaves both unset. A bridge that groups
+  // hardware has to answer them, because grouping is what takes the per-unit Speed line away from the
+  // individual member: without a way to list them, a user with forty of them can see that one is
+  // misbehaving and has no way to learn which.
+  //
+  // The member index is the unit's own numbering, from 0, and it is the SAME number the bridge uses
+  // anywhere else it names a member. get_unit_member_info returns NULL for an index the unit does not
+  // have.
 
-  const char *(*st_update_pass)  (void *);
-  const char *(*st_update_hash)  (void *);
+  int       (*get_unit_member_count) (hashcat_ctx_t *, void *, const int);
+  char     *(*get_unit_member_info)  (hashcat_ctx_t *, void *, const int, const int);
+
+  // ★ hashes IS PASSED EXPLICITLY AND YOU MUST USE IT. Do not read hashcat_ctx->hashes here.
+  //
+  // The self test hands these functions a hashes_t that is a LOCAL COPY of the real one with its
+  // digest, salt, esalt and hook salt buffers swapped for the self test's own. It is not the struct
+  // hanging off hashcat_ctx, and it never will be. A bridge that reaches through the context instead
+  // of taking the argument computes against the user's real hashes during the self test, which
+  // either passes for the wrong reason or fails for one that makes no sense.
+  //
+  // This is the one place where having the whole context is a hazard rather than a convenience, and
+  // it is why these signatures still carry what looks like redundant information. hashconfig is kept
+  // beside it for the same reason: they arrive as a pair and separating them invites the mistake.
+
+  bool      (*salt_prepare)       (hashcat_ctx_t *, void *, hashconfig_t *, hashes_t *);
+  void      (*salt_destroy)       (hashcat_ctx_t *, void *, hashconfig_t *, hashes_t *);
+
+  bool      (*thread_init)        (hashcat_ctx_t *, void *, hc_device_param_t *, hashconfig_t *, hashes_t *);
+  void      (*thread_term)        (hashcat_ctx_t *, void *, hc_device_param_t *, hashconfig_t *, hashes_t *);
+
+  bool      (*launch_loop)        (hashcat_ctx_t *, void *, hc_device_param_t *, hashconfig_t *, hashes_t *, const u32, const u64);
+  bool      (*launch_loop2)       (hashcat_ctx_t *, void *, hc_device_param_t *, hashconfig_t *, hashes_t *, const u32, const u64);
+
+  const char *(*st_update_pass)  (hashcat_ctx_t *, void *);
+  const char *(*st_update_hash)  (hashcat_ctx_t *, void *);
+
+  // Sensor readings for one unit, for bridges whose units are real hardware.
+  //
+  // hwmon otherwise describes the device that generates the candidates, which under a bridge is only
+  // the feeder. These report the device that actually does the work instead.
+  //
+  // A bridge that has no sensors leaves them all at BRIDGE_DEFAULT. Return -1 for a reading this
+  // particular unit cannot give, or 0 for the unsigned ones, which is what the rest of hwmon uses.
+
+  int (*get_unit_temperature) (hashcat_ctx_t *, void *, const int);
+
+  // Optional. A bridge unit whose hardware carries SEVERAL temperature sensors can render its own
+  // field, so all of the readings show on one line instead of a single summary number. Return false
+  // to let the plain get_unit_temperature reading be formatted as usual.
+
+  bool (*get_unit_temperature_str) (hashcat_ctx_t *, void *, const int, char *, const size_t);
+
+  // How the unit is attached, as text, when a lane count cannot say it. Optional, and only needed by a
+  // bridge whose units are not all reached the same way.
+
+  bool (*get_unit_buslanes_str) (hashcat_ctx_t *, void *, const int, char *, const size_t);
+
+  // Optional. What temperature this unit must not exceed, when the bridge knows better than the
+  // watchdog's default does. The default is chosen for GPUs, and a unit that is not one has no reason
+  // to share it: its sensor may not sit where a GPU's does, so the same number does not mean the same
+  // thing. Return 0 to keep the default.
+
+  u32 (*get_unit_temperature_abort) (hashcat_ctx_t *, void *, const int);
+
+  // Optional. How many of a unit's members report no temperature at all.
+  //
+  // A unit made of one piece of hardware is watched or it is not, and get_unit_temperature returning
+  // -1 says which. A unit made of several is neither: the watchdog acts on the hottest member that
+  // HAS a sensor, and the members that have none are simply not covered. Sensor presence is not even
+  // a property of the class, because two members can report the same class string when only one of
+  // them has a sensor fitted.
+  //
+  // So the banner has to be able to say how much of a watched unit is actually watched. Returning 0,
+  // or leaving this unset, means everything the unit holds is covered.
+
+  int (*get_unit_temperature_unwatched) (hashcat_ctx_t *, void *, const int);
+
+  int (*get_unit_fanspeed)    (hashcat_ctx_t *, void *, const int);
+  int (*get_unit_utilization) (hashcat_ctx_t *, void *, const int);
+  int (*get_unit_corespeed)   (hashcat_ctx_t *, void *, const int);
+  int (*get_unit_memoryspeed) (hashcat_ctx_t *, void *, const int);
+  int (*get_unit_buslanes)    (hashcat_ctx_t *, void *, const int);
+  u64 (*get_unit_power)       (hashcat_ctx_t *, void *, const int);
 
 } bridge_ctx_t;
 
@@ -3158,7 +4110,6 @@ typedef struct module_ctx
   u32         (*module_dgst_pos2)               (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   u32         (*module_dgst_pos3)               (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   u32         (*module_dgst_size)               (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
-  bool        (*module_dictstat_disable)        (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   u64         (*module_esalt_size)              (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
   const char *(*module_extra_tuningdb_block)    (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const backend_ctx_t *, const hashes_t *, const u32, const u32);
   u32         (*module_forced_outfile_format)   (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
@@ -3216,8 +4167,8 @@ typedef struct module_ctx
   int         (*module_hash_init_selftest)      (const hashconfig_t *, hash_t *);
 
   u64         (*module_hook_extra_param_size)   (const hashconfig_t *, const user_options_t *, const user_options_extra_t *);
-  bool        (*module_hook_extra_param_init)   (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const folder_config_t *, const backend_ctx_t *, void *);
-  bool        (*module_hook_extra_param_term)   (const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const folder_config_t *, const backend_ctx_t *, void *);
+  bool        (*module_hook_extra_param_init)   (hashcat_ctx_t *, const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const folder_config_t *, const backend_ctx_t *, void *);
+  bool        (*module_hook_extra_param_term)   (hashcat_ctx_t *, const hashconfig_t *, const user_options_t *, const user_options_extra_t *, const folder_config_t *, const backend_ctx_t *, void *);
 
   void        (*module_hook12)                  (hc_device_param_t *, const void *, const void *, const u32, const u64);
   void        (*module_hook23)                  (hc_device_param_t *, const void *, const void *, const u32, const u64);
@@ -3233,7 +4184,7 @@ typedef struct module_ctx
 
 } module_ctx_t;
 
-typedef struct hashcat_ctx
+struct hashcat_ctx
 {
   brain_ctx_t           *brain_ctx;
   bitmap_ctx_t          *bitmap_ctx;
@@ -3241,7 +4192,6 @@ typedef struct hashcat_ctx
   combinator_ctx_t      *combinator_ctx;
   cpt_ctx_t             *cpt_ctx;
   debugfile_ctx_t       *debugfile_ctx;
-  dictstat_ctx_t        *dictstat_ctx;
   event_ctx_t           *event_ctx;
   folder_config_t       *folder_config;
   generic_ctx_t         *generic_ctx;
@@ -3257,6 +4207,7 @@ typedef struct hashcat_ctx
   backend_ctx_t         *backend_ctx;
   outcheck_ctx_t        *outcheck_ctx;
   outfile_ctx_t         *outfile_ctx;
+  pubkey_ctx_t          *pubkey_ctx;
   pidfile_ctx_t         *pidfile_ctx;
   potfile_ctx_t         *potfile_ctx;
   restore_ctx_t         *restore_ctx;
@@ -3265,11 +4216,10 @@ typedef struct hashcat_ctx
   tuning_db_t           *tuning_db;
   user_options_extra_t  *user_options_extra;
   user_options_t        *user_options;
-  wl_data_t             *wl_data;
 
   void (*event) (const u32, struct hashcat_ctx *, const void *, const size_t);
 
-} hashcat_ctx_t;
+};
 
 typedef struct thread_param
 {
@@ -3295,6 +4245,14 @@ typedef struct hook_thread_param
 
   u32 salt_pos;
   u64 pws_cnt;
+
+  // An association attack gives every candidate a salt of its own, and the kernel reaches it as
+  // pws_pos + gid. A hook runs on the host and has to land on the same salt, so it is handed the
+  // base of the chunk and adds the position of the candidate it is working on. Every other attack
+  // has one salt for the whole launch and uses salt_pos.
+
+  bool salt_per_pw;
+  u64  pws_pos;
 
 } hook_thread_param_t;
 

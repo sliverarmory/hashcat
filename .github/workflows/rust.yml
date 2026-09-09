@@ -1,0 +1,114 @@
+name: Rust tests
+
+env:
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  RUSTUP_WINDOWS_PATH_ADD_BIN: 1
+  # Change to specific Rust release to pin
+  rust_stable: stable
+  rust_nightly: nightly-2025-01-25
+  rust_edition: '2021'
+  rust_clippy: '1.88'
+  rust_min: '1.88'
+
+on:
+  push:
+    branches:
+      - "master"
+    tags:
+      - v*
+    paths:
+      - 'Rust/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'Rust/**'
+      - '.github/workflows/rust.yml'
+
+jobs:
+  # Basic actions that must pass before we kick off more expensive tests.
+  basics:
+    name: basic checks
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - cargo-check
+    steps:
+      - run: exit 0
+
+  # enforce standard Rust formating (rustfmt)
+  fmt:
+    name: rustfmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          components: rustfmt
+      # Check fmt
+      - name: "rustfmt --check"
+        # Workaround for rust-lang/cargo#7732
+        run: |
+          if ! rustfmt --check --edition ${{ env.rust_edition }} $(git ls-files '*.rs'); then
+            printf "Please run \`rustfmt --edition ${{ env.rust_edition }} \$(git ls-files '*.rs')\` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2
+            exit 1
+          fi
+
+  cargo-check:
+    name: cargo check
+    needs:
+      - define-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: ${{ fromJSON(needs.define-matrix.outputs.crates) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - name: "cargo check ${{ matrix.crate }}"
+        run: cargo check
+        working-directory: ${{ matrix.crate }}
+
+  define-matrix:
+    name: get crates to test
+    runs-on: ubuntu-latest
+    outputs:
+      crates: ${{ steps.crates.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: find crates by Cargo.toml
+        id: crates
+        run: |
+          echo -n "crates=" >> "$GITHUB_OUTPUT"
+          find . -name Cargo.toml -exec dirname {} \; | jq --raw-input --slurp --compact-output 'split("\n")[:-1]' >> "$GITHUB_OUTPUT"
+
+  # test all rust code
+  test-rust:
+    name: cargo test
+    needs:
+      - basics
+      - define-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        crate: ${{ fromJSON(needs.define-matrix.outputs.crates) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+            toolchain: ${{ env.rust_stable }}
+      - name: test crate ${{ matrix.crate }} on ${{ matrix.os }}
+        run: cargo test
+        working-directory: ${{ matrix.crate }}

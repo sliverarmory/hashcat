@@ -35,6 +35,11 @@ Gabriele "matrix" Gristina <matrix@hashcat.net> (@gm4tr1x)
 * Benchmarks initial code base
 * hashcat-toolchain docker
 
+Ahmed "ahmed-alnassif" Al-Nassif <mr.ahmed.nassif@gmail.com> (@ahmed-alnassif)
+
+* Android port with Termux support
+* Android build documentation and setup guide
+
 Jean-Christophe "Fist0urs" Delaunay <jean-christophe.delaunay@synacktiv.com> (@Fist0urs)
 
 * Kerberos TGS Rep enctype 23 kernel module
@@ -51,6 +56,10 @@ Jeremi "epixoip" Gosney <jgosney@terahash.com> (@jmgosney)
 * Moderating the hashcat forum
 * Helping tons of new users find their way into the hashcat universe
 
+magnum
+
+* RAR3 Huffman validity check in the -m 23800 kernel module
+
 Other contributors to hashcat
 
 * A full list and their commits can be found here:
@@ -58,12 +67,19 @@ Other contributors to hashcat
 
 # hashcat relies on some libraries, including:
 
-* xxHash by Yann Collet (@Cyan4973)
-* LZMA-SDK by Igor Pavlov
-* zlib by Jean-loup Gailly and Mark Adler
-* win-iconv by Yukihiro Nakadaira
+* liblzma by Lasse Collin and Igor Pavlov (loaded at runtime)
+* zlib by Jean-loup Gailly and Mark Adler (loaded at runtime)
+* zstd by Yann Collet (@Cyan4973) (loaded at runtime)
 * micro-ecc by Ken MacKay (used as reference for some secp256k1 operations)
-* UnRAR by Alexander Roshal
+* PPMd var.H by Dmitry Shkarin and Dmitry Subbotin, in Igor Pavlov's 7-Zip implementation (vendored)
+
+# hashcat implements the following algorithms designed by others:
+
+* xxHash by Yann Collet (@Cyan4973)
+  paw64, hashcat's own 64 bit identity hash, carries no xxHash code and produces
+  different digests, but it follows the ground xxHash broke: that a short input
+  deserves a different shape from a long one, and that a multiply, a fold and a
+  strong final avalanche are enough.
 
 # Furthermore the following persons helped the project:
 
@@ -95,5 +111,11 @@ Costin Enache <costin@detack.de>
 * RACF KDFAES module
 * IBM AS400 DES and SSHA1 modules
 * Cisco-ISE Hashed Password (SHA256) module
+
+Shooter3k
+* Multibyte characters written directly in rule operands, and UTF-8 console output on Windows
+* Narrowing the potfile search and batching the cracked result writes
+* A breakdown of where a run's wall clock goes, and the pipeline instrument as an option
+* Long-standing bugfix ideas in rule file loading, --show and --left, --loopback, and checkpointing
 
 !!! All the package maintainers of hashcat !!!

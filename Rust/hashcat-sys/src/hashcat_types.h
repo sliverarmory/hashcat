@@ -3,11 +3,7 @@
  * License.....: MIT
  */
 
-#ifdef __BINDGEN__
-typedef unsigned int uint32_t;
-#else
 #include <stdint.h>
-#endif
 
 typedef uint32_t u32;
 typedef void unit_t;
