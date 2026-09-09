@@ -376,3 +376,13 @@ RUN if [ "$WITH_CODE_ANALYSIS" -eq "1" ]; then \
     fi
 
 CMD ["/bin/bash"]
+
+# Keep the release workflow from importing the multi-gigabyte compiler image.
+# This target contains only the finished package tree and its build provenance.
+FROM scratch AS release-output
+
+COPY --from=hashcat-builder /root/xy/ /xy/
+COPY --from=hashcat-builder /root/toolchain-info.log /toolchain-info.log
+
+# Preserve the historical default image for users of this Dockerfile.
+FROM hashcat-builder AS default

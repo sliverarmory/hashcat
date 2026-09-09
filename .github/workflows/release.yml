@@ -63,8 +63,8 @@ jobs:
         with:
           context: .
           file: docker/hashcat_binaries.ubuntu
-          load: true
-          tags: hashcat-release:${{ github.sha }}
+          target: release-output
+          outputs: type=local,dest=cross-output
           build-args: |
             CACHE_BUST=${{ github.ref_name }}-${{ github.sha }}
             HASHCAT_REPOSITORY=https://github.com/${{ github.repository }}.git
@@ -81,16 +81,9 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          container="$(docker create "hashcat-release:$GITHUB_SHA")"
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          mkdir -p dist
 
-          mkdir -p cross-output dist
-          docker cp "$container:/root/xy/." cross-output/
-          docker cp "$container:/root/toolchain-info.log" cross-output/toolchain-info.log
-          docker rm "$container"
-          trap - EXIT
-
-          package_dirs=(cross-output/hashcat-*/)
+          package_dirs=(cross-output/xy/hashcat-*/)
 
           if [ "${#package_dirs[@]}" -ne 1 ]; then
             echo '! the release image did not contain exactly one unpacked hashcat directory'
