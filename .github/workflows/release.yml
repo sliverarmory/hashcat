@@ -70,6 +70,7 @@ jobs:
             HASHCAT_REPOSITORY=https://github.com/${{ github.repository }}.git
             HASHCAT_REF=${{ github.sha }}
             SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+            VERSION_TAG=${{ steps.source.outputs.expected_version }}
           cache-from: type=gha,scope=hashcat-release-x86_64
           cache-to: type=gha,mode=max,scope=hashcat-release-x86_64,ignore-error=true
 

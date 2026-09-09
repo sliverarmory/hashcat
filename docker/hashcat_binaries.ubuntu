@@ -242,11 +242,15 @@ ENV PATH=/root/.cargo/bin:$PATH
 # the host, picks the host linker and stops on the first link flag that only means something to PE.
 # The default is master until the first release that contains the core library exists to name, and the
 # check below refuses an older tree in one line rather than letting it fail at the link.
+# VERSION_TAG can be supplied by a release caller so the binary and package name do not depend on
+# the adaptive object-name abbreviation chosen by different Git versions. An omitted value keeps
+# the upstream behavior and derives the version inside the cloned tree.
 
 ARG CACHE_BUST=1 \
     HASHCAT_REPOSITORY=https://github.com/hashcat/hashcat.git \
     HASHCAT_REF=master \
     SOURCE_DATE_EPOCH=1 \
+    VERSION_TAG= \
     ENABLE_LTO=1 \
     MAINTAINER_MODE=1 \
     USE_CLANG=1 \
@@ -256,6 +260,7 @@ ENV CACHE_BUST=${CACHE_BUST} \
     HASHCAT_REPOSITORY=${HASHCAT_REPOSITORY} \
     HASHCAT_REF=${HASHCAT_REF} \
     SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    VERSION_TAG=${VERSION_TAG} \
     ENABLE_LTO=${ENABLE_LTO} \
     MAINTAINER_MODE=${MAINTAINER_MODE} \
     USE_CLANG=${USE_CLANG} \
@@ -292,13 +297,15 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN if [ "${USE_CLANG}" = "1" ]; then \
       cp -af /root/hashcat /root/hashcat-clang && cd /root/hashcat-clang && \
-      make ENABLE_LTO=${ENABLE_LTO} \
+      version_tag="${VERSION_TAG:-$(make -s version | tail -1)}" && \
+      make "VERSION_TAG=${version_tag}" \
+           ENABLE_LTO=${ENABLE_LTO} \
            MAINTAINER_MODE=${MAINTAINER_MODE} \
            AR=llvm-ar AR_LINUX=llvm-ar AR_WIN=llvm-ar \
            CC=clang CC_LINUX=clang CC_WIN=clang \
            CXX=clang++ CXX_LINUX=clang++ CXX_WIN=clang++ \
            binaries -s -j ${MAX_CORE} 2>&1 | stdbuf -oL -eL tee -a /root/binaries.clang.log && \
-      tools/package_bin.sh && \
+      MAKEFLAGS="VERSION_TAG=${version_tag}" tools/package_bin.sh && \
       cd /root/xy && \
       if [ "${USE_GCC}" = "1" ]; then \
         for f in hashcat-*; do \
@@ -313,10 +320,12 @@ RUN if [ "${USE_CLANG}" = "1" ]; then \
 
 RUN if [ "${USE_GCC}" = "1" ]; then \
       cp -af /root/hashcat /root/hashcat-gcc && cd /root/hashcat-gcc && \
-      make ENABLE_LTO=${ENABLE_LTO} \
+      version_tag="${VERSION_TAG:-$(make -s version | tail -1)}" && \
+      make "VERSION_TAG=${version_tag}" \
+           ENABLE_LTO=${ENABLE_LTO} \
            MAINTAINER_MODE=${MAINTAINER_MODE} \
            binaries -s -j ${MAX_CORE} 2>&1 | stdbuf -oL -eL  tee -a /root/binaries.gcc.log && \
-      tools/package_bin.sh && \
+      MAKEFLAGS="VERSION_TAG=${version_tag}" tools/package_bin.sh && \
       cd /root/xy && \
       if [ "${USE_CLANG}" = "1" ]; then \
         for f in hashcat-*; do \
@@ -341,6 +350,7 @@ ENV WITH_CODE_ANALYSIS=${WITH_CODE_ANALYSIS}
 RUN echo "HASHCAT_REF: ${HASHCAT_REF}" >> /root/toolchain-info.log && \
     echo "HASHCAT_REPOSITORY: ${HASHCAT_REPOSITORY}" >> /root/toolchain-info.log && \
     echo "SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH}" >> /root/toolchain-info.log && \
+    echo "VERSION_TAG: ${VERSION_TAG}" >> /root/toolchain-info.log && \
     echo "WIN_PYTHON_VERSION: ${WIN_PYTHON_VERSION}" >> /root/toolchain-info.log && \
     echo "XZ_VERSION: ${XZ_VERSION}" >> /root/toolchain-info.log && \
     echo "XZ_REF: ${XZ_REF}" >> /root/toolchain-info.log && \
