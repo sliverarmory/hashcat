@@ -188,7 +188,10 @@ if [ "$platform" = "windows" ]; then
     exit 1
   fi
 
-  if ! strings "$binary" | tr -d '\r' | grep -Fqx "$EXPECTED_VERSION"; then
+  if ! strings "$binary" | tr -d '\r' | awk -v expected="$EXPECTED_VERSION" '
+    $0 == expected { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
     echo "! the Windows binary does not contain the expected version: $EXPECTED_VERSION"
     exit 1
   fi
