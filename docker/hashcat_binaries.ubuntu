@@ -103,10 +103,16 @@ RUN cd $WD/src && git clone --depth 1 --branch ${SEVEN_ZIP_VERSION} https://gith
 ARG XZ_VERSION=5.8.3
 ARG ZLIB_VERSION=1.3.2
 ARG ZSTD_VERSION=1.5.7
+ARG XZ_REF=4b73f2ec19a99ef465282fbce633e8deb33691b3
+ARG ZLIB_REF=da607da739fa6047df13e66a2af6b8bec7c2a498
+ARG ZSTD_REF=f8745da6ff1ad1e7bab384bd1f9d742439278e99
 
 ENV XZ_VERSION=${XZ_VERSION} \
     ZLIB_VERSION=${ZLIB_VERSION} \
-    ZSTD_VERSION=${ZSTD_VERSION}
+    ZSTD_VERSION=${ZSTD_VERSION} \
+    XZ_REF=${XZ_REF} \
+    ZLIB_REF=${ZLIB_REF} \
+    ZSTD_REF=${ZSTD_REF}
 
 ENV WIN_DLL_DIR=/opt/win-dll-64
 
@@ -129,6 +135,7 @@ RUN mkdir -p ${WIN_DLL_DIR}
 # a missing -lgcc_s rather than quietly producing a DLL that needs libgcc_s_seh-1.dll beside it.
 
 RUN cd $WD/src && git clone --depth 1 --branch v${XZ_VERSION} https://github.com/tukaani-project/xz.git && cd xz && \
+    test "$(git rev-parse HEAD)" = "${XZ_REF}" && \
     ./autogen.sh --no-po4a && \
     ./configure --host=x86_64-w64-mingw32 --enable-shared --disable-static --disable-xz --disable-xzdec \
                 --disable-lzmadec --disable-lzmainfo --disable-scripts --disable-doc --disable-nls \
@@ -142,6 +149,7 @@ RUN cd $WD/src && git clone --depth 1 --branch v${XZ_VERSION} https://github.com
 # programs the package has no use for.
 
 RUN cd $WD/src && git clone --depth 1 --branch v${ZLIB_VERSION} https://github.com/madler/zlib.git && cd zlib && \
+    test "$(git rev-parse HEAD)" = "${ZLIB_REF}" && \
     make -f win32/Makefile.gcc PREFIX=x86_64-w64-mingw32- LDFLAGS="-static-libgcc" -j zlib1.dll && \
     cp zlib1.dll ${WIN_DLL_DIR}/ && \
     cd $WD/src && rm -rf zlib
@@ -153,6 +161,7 @@ RUN cd $WD/src && git clone --depth 1 --branch v${ZLIB_VERSION} https://github.c
 # libzstd, which resolves to dll/libzstd.dll on Windows; there is no libzstd.dll target.
 
 RUN cd $WD/src && git clone --depth 1 --branch v${ZSTD_VERSION} https://github.com/facebook/zstd.git && cd zstd/lib && \
+    test "$(git -C .. rev-parse HEAD)" = "${ZSTD_REF}" && \
     make -j CC=x86_64-w64-mingw32-gcc AR=x86_64-w64-mingw32-ar \
          TARGET_SYSTEM=Windows LDFLAGS="-static-libgcc" libzstd && \
     cp dll/libzstd.dll ${WIN_DLL_DIR}/ && \
@@ -230,20 +239,24 @@ ENV PATH=/root/.cargo/bin:$PATH
 # check below refuses an older tree in one line rather than letting it fail at the link.
 
 ARG CACHE_BUST=1 \
+    HASHCAT_REPOSITORY=https://github.com/hashcat/hashcat.git \
     HASHCAT_REF=master \
+    SOURCE_DATE_EPOCH=1 \
     ENABLE_LTO=1 \
     MAINTAINER_MODE=1 \
     USE_CLANG=1 \
     USE_GCC=0
 
 ENV CACHE_BUST=${CACHE_BUST} \
+    HASHCAT_REPOSITORY=${HASHCAT_REPOSITORY} \
     HASHCAT_REF=${HASHCAT_REF} \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     ENABLE_LTO=${ENABLE_LTO} \
     MAINTAINER_MODE=${MAINTAINER_MODE} \
     USE_CLANG=${USE_CLANG} \
     USE_GCC=${USE_GCC}
 
-RUN cd /root && git clone https://github.com/hashcat/hashcat.git && git -C hashcat checkout --detach ${HASHCAT_REF}
+RUN cd /root && git clone "${HASHCAT_REPOSITORY}" hashcat && git -C hashcat checkout --detach "${HASHCAT_REF}"
 
 RUN test -f /root/hashcat/include/export.h || { echo "HASHCAT_REF=${HASHCAT_REF} predates the shared core, which this file cannot build"; exit 1; }
 
@@ -321,10 +334,15 @@ ARG WITH_CODE_ANALYSIS=0
 ENV WITH_CODE_ANALYSIS=${WITH_CODE_ANALYSIS}
 
 RUN echo "HASHCAT_REF: ${HASHCAT_REF}" >> /root/toolchain-info.log && \
+    echo "HASHCAT_REPOSITORY: ${HASHCAT_REPOSITORY}" >> /root/toolchain-info.log && \
+    echo "SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH}" >> /root/toolchain-info.log && \
     echo "WIN_PYTHON_VERSION: ${WIN_PYTHON_VERSION}" >> /root/toolchain-info.log && \
     echo "XZ_VERSION: ${XZ_VERSION}" >> /root/toolchain-info.log && \
+    echo "XZ_REF: ${XZ_REF}" >> /root/toolchain-info.log && \
     echo "ZLIB_VERSION: ${ZLIB_VERSION}" >> /root/toolchain-info.log && \
+    echo "ZLIB_REF: ${ZLIB_REF}" >> /root/toolchain-info.log && \
     echo "ZSTD_VERSION: ${ZSTD_VERSION}" >> /root/toolchain-info.log && \
+    echo "ZSTD_REF: ${ZSTD_REF}" >> /root/toolchain-info.log && \
     echo "GMP_VERSION: ${GMP_VERSION}" >> /root/toolchain-info.log && \
     echo "SEVEN_ZIP_VERSION: ${SEVEN_ZIP_VERSION}" >> /root/toolchain-info.log && \
     echo "RUST_VERSION: ${RUST_VERSION}" >> /root/toolchain-info.log && \
@@ -333,7 +351,7 @@ RUN echo "HASHCAT_REF: ${HASHCAT_REF}" >> /root/toolchain-info.log && \
     echo "USE_CLANG: ${USE_CLANG}" >> /root/toolchain-info.log && \
     echo "USE_GCC: ${USE_GCC}" >> /root/toolchain-info.log && \
     echo "WITH_CODE_ANALYSIS: ${WITH_CODE_ANALYSIS}" >> /root/toolchain-info.log && \
-    echo -n "GLIBC_VERSION: " >> tee -a /root/toolchain-info.log && \
+    printf 'GLIBC_VERSION: ' >> /root/toolchain-info.log && \
     strings /root/xy/hashcat-*/hashcat.bin | grep -o 'GLIBC_[0-9]\+\.[0-9]\+' | sort -V | tail -1 >> /root/toolchain-info.log && \
     ldd /root/xy/hashcat-*/hashcat.bin | tee -a /root/linux_libs_dump.log && \
     x86_64-w64-mingw32-objdump -p /root/xy/hashcat-*/hashcat.exe | grep 'DLL Name' | tee -a /root/win_libs_dump.log

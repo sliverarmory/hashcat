@@ -1,0 +1,454 @@
+name: Release binaries
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*.*.*-armory.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build-cross:
+    name: Build Linux/amd64 and Windows/amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Prepare source metadata
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_version="$(make -s version | tail -1)"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+
+          case "$expected_version" in
+            v[0-9]*) ;;
+            *) echo "! invalid source version: $expected_version"; exit 1 ;;
+          esac
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-armory\.[0-9]+$ ]]; then
+              echo "! unsupported release tag: $GITHUB_REF_NAME"
+              exit 1
+            fi
+
+            test "$expected_version" = "$GITHUB_REF_NAME"
+          fi
+
+          echo "expected_version=$expected_version" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils file unzip zip
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build with the upstream release toolchain
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/hashcat_binaries.ubuntu
+          load: true
+          tags: hashcat-release:${{ github.sha }}
+          build-args: |
+            CACHE_BUST=${{ github.ref_name }}-${{ github.sha }}
+            HASHCAT_REPOSITORY=https://github.com/${{ github.repository }}.git
+            HASHCAT_REF=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+          cache-from: type=gha,scope=hashcat-release-x86_64
+          cache-to: type=gha,mode=max,scope=hashcat-release-x86_64,ignore-error=true
+
+      - name: Create reproducible ZIP archives
+        env:
+          EXPECTED_VERSION: ${{ steps.source.outputs.expected_version }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          container="$(docker create "hashcat-release:$GITHUB_SHA")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+
+          mkdir -p cross-output dist
+          docker cp "$container:/root/xy/." cross-output/
+          docker cp "$container:/root/toolchain-info.log" cross-output/toolchain-info.log
+          docker rm "$container"
+          trap - EXIT
+
+          package_dirs=(cross-output/hashcat-*/)
+
+          if [ "${#package_dirs[@]}" -ne 1 ]; then
+            echo '! the release image did not contain exactly one unpacked hashcat directory'
+            printf '%s\n' "${package_dirs[@]}"
+            exit 1
+          fi
+
+          package_dir="${package_dirs[0]%/}"
+          cp cross-output/toolchain-info.log "$package_dir/docs/hashcat-build-provenance.txt"
+
+          (
+            cd "$package_dir"
+            bash "$GITHUB_WORKSPACE/.github/workflows/package_release.sh" \
+              linux amd64 "$GITHUB_WORKSPACE/dist/hashcat-linux_amd64.zip"
+            WIN_DLL_DIR=. bash "$GITHUB_WORKSPACE/.github/workflows/package_release.sh" \
+              windows amd64 "$GITHUB_WORKSPACE/dist/hashcat-windows_amd64.zip"
+
+            bash "$GITHUB_WORKSPACE/.github/workflows/package_release.sh" \
+              linux amd64 "$GITHUB_WORKSPACE/dist/hashcat-linux_amd64.repeat.zip"
+            WIN_DLL_DIR=. bash "$GITHUB_WORKSPACE/.github/workflows/package_release.sh" \
+              windows amd64 "$GITHUB_WORKSPACE/dist/hashcat-windows_amd64.repeat.zip"
+          )
+
+          cmp dist/hashcat-linux_amd64.zip dist/hashcat-linux_amd64.repeat.zip
+          cmp dist/hashcat-windows_amd64.zip dist/hashcat-windows_amd64.repeat.zip
+          rm dist/*.repeat.zip
+
+      - name: Test Linux archive and inspect Windows archive
+        env:
+          EXPECTED_VERSION: ${{ steps.source.outputs.expected_version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-verify/linux release-verify/windows
+          unzip -q dist/hashcat-linux_amd64.zip -d release-verify/linux
+          unzip -q dist/hashcat-windows_amd64.zip -d release-verify/windows
+
+          test "$(release-verify/linux/hashcat.bin --version)" = "$EXPECTED_VERSION"
+          bash tools/test_package.sh release-verify/linux --no-device
+
+          test -f release-verify/windows/hashcat.exe
+          test -f release-verify/windows/hashcat.dll
+          test -f release-verify/windows/liblzma.dll
+          test -f release-verify/windows/zlib1.dll
+          test -f release-verify/windows/libzstd.dll
+          test -z "$(find release-verify/windows/modules release-verify/windows/bridges release-verify/windows/feeds -type f -name '*.so' -print -quit)"
+          test -z "$(find release-verify/linux/modules release-verify/linux/bridges release-verify/linux/feeds -type f -name '*.dll' -print -quit)"
+
+          : > release-verify/windows-imports.txt
+
+          while IFS= read -r -d '' artifact; do
+            file "$artifact" | grep -q 'PE32+ executable.*x86-64'
+            printf '== %s\n' "$artifact" >> release-verify/windows-imports.txt
+            objdump -p "$artifact" | grep 'DLL Name' >> release-verify/windows-imports.txt
+          done < <(find release-verify/windows -type f \( -name '*.exe' -o -name '*.dll' \) -print0)
+
+          cat release-verify/windows-imports.txt
+
+          if grep -iE 'DLL Name: *(libgcc|libwinpthread|libstdc\+\+|libssp|cyg|msys)' release-verify/windows-imports.txt; then
+            echo '! a Windows artifact imports a MinGW, Cygwin, or MSYS runtime library'
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-cross
+          path: |
+            dist/hashcat-linux_amd64.zip
+            dist/hashcat-windows_amd64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build-darwin:
+    name: Build Darwin/arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Build, package, and test
+        env:
+          SHARED: 1
+          TERM: xterm
+        run: |
+          set -euo pipefail
+
+          EXPECTED_VERSION="$(make -s version | tail -1)"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export EXPECTED_VERSION SOURCE_DATE_EPOCH
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-armory\.[0-9]+$ ]]; then
+              echo "! unsupported release tag: $GITHUB_REF_NAME"
+              exit 1
+            fi
+
+            test "$EXPECTED_VERSION" = "$GITHUB_REF_NAME"
+          fi
+
+          make clean
+          make ENABLE_LTO=0 MAINTAINER_MODE=1 CC=clang CXX=clang++
+          bash tools/test_package.sh . --no-device
+
+          {
+            printf 'HASHCAT_REPOSITORY: https://github.com/%s.git\n' "$GITHUB_REPOSITORY"
+            printf 'HASHCAT_REF: %s\n' "$GITHUB_SHA"
+            printf 'SOURCE_DATE_EPOCH: %s\n' "$SOURCE_DATE_EPOCH"
+            printf 'RUNNER: macos-15 arm64\n'
+            clang --version | head -1
+          } > docs/hashcat-build-provenance.txt
+
+          mkdir -p dist
+          bash .github/workflows/package_release.sh \
+            darwin arm64 dist/hashcat-darwin_arm64.zip
+          bash .github/workflows/package_release.sh \
+            darwin arm64 dist/hashcat-darwin_arm64.repeat.zip
+          cmp dist/hashcat-darwin_arm64.zip dist/hashcat-darwin_arm64.repeat.zip
+          rm dist/hashcat-darwin_arm64.repeat.zip
+
+          mkdir -p release-verify
+          unzip -q dist/hashcat-darwin_arm64.zip -d release-verify
+          test "$(release-verify/hashcat --version)" = "$EXPECTED_VERSION"
+          bash tools/test_package.sh release-verify --no-device
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-darwin_arm64
+          path: dist/hashcat-darwin_arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  test-windows:
+    name: Test Windows/amd64 archive
+    needs: build-cross
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-cross
+          path: release
+
+      - name: Smoke test without build tools on PATH
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'release/hashcat-windows_amd64.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'hashcat-clean-path'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Push-Location $destination
+
+          try {
+            $version = & .\hashcat.exe --version
+            if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v[0-9]') {
+              throw "hashcat.exe failed with a clean PATH: $version"
+            }
+
+            $moduleCount = @(Get-ChildItem modules/module_*.dll).Count
+            $listedCount = @(& .\hashcat.exe --hash-info --quiet | Select-String '^Hash mode #').Count
+
+            if ($LASTEXITCODE -ne 0 -or $listedCount -ne $moduleCount) {
+              throw "Only $listedCount of $moduleCount modules loaded with a clean PATH"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          update: true
+          install: |
+            file
+            git
+            gzip
+            make
+            mingw-w64-x86_64-binutils
+            python3
+            unzip
+            xz
+            zstd
+
+      - name: Run package checks
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          expected_version="$(make -s version | tail -1)"
+          mkdir -p release-verify
+          unzip -q release/hashcat-windows_amd64.zip -d release-verify
+          chmod 755 release-verify/hashcat.exe
+          test "$(release-verify/hashcat.exe --version | tr -d '\r')" = "$expected_version"
+          bash tools/test_package.sh release-verify --no-device 2>&1 | tee package-test.log
+
+          for format in gz xz zst; do
+            grep -Eq "^ok +a \.$format wordlist reads back" package-test.log
+          done
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs:
+      - build-cross
+      - build-darwin
+      - test-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-armory\.[0-9]+$ ]]; then
+            echo "! unsupported release tag: $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git fetch origin master --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)"
+          test "$tag_object" = "$(git rev-parse "refs/tags/$GITHUB_REF_NAME")"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .verification.verified)" = true
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq .object.sha)" = "$GITHUB_SHA"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify release files
+        run: |
+          set -euo pipefail
+
+          expected="$({
+            printf '%s\n' hashcat-darwin_arm64.zip
+            printf '%s\n' hashcat-linux_amd64.zip
+            printf '%s\n' hashcat-windows_amd64.zip
+          } | sort)"
+          actual="$(find release -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort)"
+
+          if [ "$actual" != "$expected" ]; then
+            echo '! release ZIP set is not the expected three files'
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+          for archive in release/*.zip; do
+            unzip -t "$archive"
+          done
+
+          (
+            cd release
+            sha256sum hashcat-darwin_arm64.zip hashcat-linux_amd64.zip hashcat-windows_amd64.zip > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Publish and independently verify release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="$GITHUB_REF_NAME"
+
+          verify_remote_assets ()
+          {
+            expected="$({
+              printf '%s\n' SHA256SUMS
+              printf '%s\n' hashcat-darwin_arm64.zip
+              printf '%s\n' hashcat-linux_amd64.zip
+              printf '%s\n' hashcat-windows_amd64.zip
+            } | sort)"
+            actual="$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)"
+
+            if [ "$actual" != "$expected" ]; then
+              echo '! remote release asset set does not match the local release files'
+              diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+              exit 1
+            fi
+
+            for file in release/*; do
+              name="$(basename "$file")"
+              local_size="$(wc -c < "$file" | tr -d '[:space:]')"
+              local_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+              remote_size="$(gh release view "$tag" --json assets --jq ".assets[] | select(.name == \"$name\") | .size")"
+              remote_digest=''
+
+              for attempt in $(seq 1 12); do
+                remote_digest="$(gh release view "$tag" --json assets --jq ".assets[] | select(.name == \"$name\") | .digest")"
+                [ "$remote_digest" = "$local_digest" ] && break
+                echo "waiting for digest for $name ($attempt/12)"
+                sleep 5
+              done
+
+              test "$remote_size" = "$local_size"
+              test "$remote_digest" = "$local_digest"
+            done
+          }
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+          else
+            gh release create "$tag" --draft --generate-notes --title "hashcat $tag" --verify-tag
+            is_draft=true
+          fi
+
+          if [ "$is_draft" = true ]; then
+            gh release upload "$tag" \
+              release/hashcat-darwin_arm64.zip \
+              release/hashcat-linux_amd64.zip \
+              release/hashcat-windows_amd64.zip \
+              release/SHA256SUMS \
+              --clobber
+            verify_remote_assets
+            gh release edit "$tag" --draft=false --latest
+          fi
+
+          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)" = false
+          test "$(gh release view "$tag" --json tagName --jq .tagName)" = "$tag"
+
+          download_dir="$(mktemp -d)"
+          trap 'rm -rf "$download_dir"' EXIT
+          gh release download "$tag" --dir "$download_dir"
+
+          expected="$({
+            printf '%s\n' SHA256SUMS
+            printf '%s\n' hashcat-darwin_arm64.zip
+            printf '%s\n' hashcat-linux_amd64.zip
+            printf '%s\n' hashcat-windows_amd64.zip
+          } | sort)"
+          actual="$(find "$download_dir" -maxdepth 1 -type f -printf '%f\n' | sort)"
+          test "$actual" = "$expected"
+
+          (
+            cd "$download_dir"
+            sha256sum -c SHA256SUMS
+          )
+
+          verify_remote_assets
