@@ -142,11 +142,11 @@ int benchmark_next (hashcat_ctx_t *hashcat_ctx)
     return hash_mode;
   }
 
-  char *modulefile = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *modulefile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
   for (int i = cur; i < MODULE_HASH_MODES_MAXIMUM; i++)
   {
-    module_filename (folder_config, i, modulefile, HCBUFSIZ_TINY);
+    module_filename (folder_config, i, modulefile, HCBUFSIZ_SMALL);
 
     if (hc_path_exist (modulefile) == true)
     {

@@ -38,9 +38,9 @@ bool module_load (hashcat_ctx_t *hashcat_ctx, module_ctx_t *module_ctx, const u3
 
   memset (module_ctx, 0, sizeof (module_ctx_t));
 
-  char *module_file = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *module_file = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
-  module_filename (folder_config, hash_mode, module_file, HCBUFSIZ_TINY);
+  module_filename (folder_config, hash_mode, module_file, HCBUFSIZ_SMALL);
 
   struct stat s;
 
@@ -392,7 +392,7 @@ int hashconfig_init (hashcat_ctx_t *hashcat_ctx)
     // some kernels do not have an optimized kernel, simply because they do not need them
     // or because they are not yet converted, for them we should switch off optimized mode
 
-    char source_file[256] = { 0 };
+    char source_file[HCBUFSIZ_SMALL] = { 0 };
 
     generate_source_kernel_filename (user_options->slow_candidates, hashconfig->attack_exec, user_options_extra->attack_kern, hashconfig->kern_type, false, folder_config->shared_dir, source_file);
 

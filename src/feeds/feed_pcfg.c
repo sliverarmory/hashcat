@@ -498,7 +498,7 @@ static bool pcfg_fopen (HCFILE *fp, const char *path)
 {
   if (hc_fopen (fp, path, "rb") == true) return true;
 
-  char xz[PATH_MAX + 1];
+  char xz[HCBUFSIZ_SMALL];
 
   const int len = snprintf (xz, sizeof (xz), "%s.xz", path);
 
@@ -817,9 +817,9 @@ static char *pcfg_resolve_root (const generic_global_ctx_t *global_ctx, const ch
 
     for (u32 k = 0; k < 2; k++)
     {
-      char *path = (char *) hcmalloc (HCBUFSIZ_TINY);
+      char *path = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
-      snprintf (path, HCBUFSIZ_TINY, forms[k], roots[i], name);
+      snprintf (path, HCBUFSIZ_SMALL, forms[k], roots[i], name);
 
       if (hc_path_exist (path) == true)
       {
@@ -1302,7 +1302,7 @@ static bool root_open (const pcfg_root_t *r, const char *rel, HCFILE *fp)
     return rc;
   }
 
-  char path[HCBUFSIZ_TINY];
+  char path[HCBUFSIZ_SMALL];
 
   snprintf (path, sizeof (path), "%s/%s", r->dir, rel);
 
@@ -3092,7 +3092,7 @@ typedef struct
 
 static int omen_load_one (generic_global_ctx_t *global_ctx, const pcfg_global_t *pg, pcfg_omen_t *om, const pcfg_root_t *r)
 {
-  char path[HCBUFSIZ_TINY];
+  char path[HCBUFSIZ_SMALL];
   char line[HCBUFSIZ_TINY];
 
   HCFILE fp;
@@ -3609,7 +3609,7 @@ static void omen_free (pcfg_omen_t *om)
 
 static double omen_mass (const pcfg_root_t *r)
 {
-  char path[HCBUFSIZ_TINY];
+  char path[HCBUFSIZ_SMALL];
   char line[HCBUFSIZ_TINY];
 
   const char *rel = "Grammar/grammar.txt";

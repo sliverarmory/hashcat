@@ -391,9 +391,12 @@ static bool seekdb_save (const char *path, const char *wordlist, const u64 line_
 
   for (size_t i = (size_t) header_len; i < (size_t) SEEKDB_HEADER_SIZE; i++) header[i] = '\n';
 
-  char tmp[1024];
+  char tmp[HCBUFSIZ_SMALL];
 
-  snprintf (tmp, sizeof (tmp), "%s.tmp.%d", path, (int) SEEKDB_GETPID ());
+  const int tmp_len = snprintf (tmp, sizeof (tmp), "%s.tmp.%d", path, (int) SEEKDB_GETPID ());
+
+  if (tmp_len < 0) return false;
+  if (tmp_len >= (int) sizeof (tmp)) return false;
 
   HCFILE fp;
 

@@ -360,7 +360,7 @@ void usage_big_print (hashcat_ctx_t *hashcat_ctx)
 
   if (user_options->usage > 1)
   {
-    char *modulefile = (char *) hcmalloc (HCBUFSIZ_TINY);
+    char *modulefile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
     usage_sort_buf = (usage_sort_t *) hccalloc (MODULE_HASH_MODES_MAXIMUM, sizeof (usage_sort_t));
 
@@ -368,7 +368,7 @@ void usage_big_print (hashcat_ctx_t *hashcat_ctx)
     {
       user_options->hash_mode = i;
 
-      module_filename (folder_config, i, modulefile, HCBUFSIZ_TINY);
+      module_filename (folder_config, i, modulefile, HCBUFSIZ_SMALL);
 
       if (hc_path_exist (modulefile) == false) continue;
 

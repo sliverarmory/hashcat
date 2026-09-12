@@ -4425,9 +4425,9 @@ int user_options_check_files (hashcat_ctx_t *hashcat_ctx)
 
   // single kernel and module existence check to detect "7z e" errors
 
-  char *modulefile = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *modulefile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
-  module_filename (folder_config, 0, modulefile, HCBUFSIZ_TINY);
+  module_filename (folder_config, 0, modulefile, HCBUFSIZ_SMALL);
 
   if (hc_path_exist (modulefile) == false)
   {
@@ -4458,7 +4458,7 @@ int user_options_check_files (hashcat_ctx_t *hashcat_ctx)
 
   // same check but for an backend kernel
 
-  char *kernelfile = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *kernelfile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
   generate_source_kernel_filename (false, ATTACK_EXEC_OUTSIDE_KERNEL, ATTACK_KERN_STRAIGHT, 400, 0, folder_config->shared_dir, kernelfile);
 

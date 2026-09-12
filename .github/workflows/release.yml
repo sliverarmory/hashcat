@@ -238,8 +238,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = Join-Path $env:GITHUB_WORKSPACE 'release/hashcat-windows_amd64.zip'
-          $destination = Join-Path $env:RUNNER_TEMP 'hashcat-clean-path'
+          $destination = Join-Path $env:RUNNER_TEMP 'hashcat clean, packaged path'
+          $isolatedCwd = Join-Path $env:RUNNER_TEMP 'hashcat-isolated-cwd'
           Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          New-Item -ItemType Directory -Force -Path $isolatedCwd | Out-Null
 
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           Push-Location $destination
@@ -260,6 +262,25 @@ jobs:
           finally {
             Pop-Location
           }
+
+          $binary = Join-Path $destination 'hashcat.exe'
+          Push-Location $isolatedCwd
+
+          try {
+            $keyspace = & $binary -m 0 -a 3 --keyspace '?d?d'
+            $keyspaceExitCode = $LASTEXITCODE
+          }
+          finally {
+            Pop-Location
+          }
+
+          $keyspace = ($keyspace | Out-String).Trim()
+
+          if ($keyspaceExitCode -ne 0 -or $keyspace -ne '10') {
+            throw "hashcat.exe failed outside its package directory: rc=$keyspaceExitCode output=$keyspace"
+          }
+
+          Write-Host "Isolated-CWD keyspace: $keyspace"
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:

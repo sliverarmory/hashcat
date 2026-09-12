@@ -2312,7 +2312,7 @@ typedef struct hc_device_param
 
 typedef struct kernel_build
 {
-  char cached_file[256];
+  char *cached_file;
 
   bool done;
   bool failed;

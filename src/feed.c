@@ -653,16 +653,23 @@ static void feed_optv_add (feed_optv_t *o, const char *fmt, ...)
     return;
   }
 
-  char buf[1024];
+  char *option = NULL;
 
   va_list ap;
   va_start (ap, fmt);
 
-  vsnprintf (buf, sizeof (buf), fmt, ap);
+  const int rc = vasprintf (&option, fmt, ap);
 
   va_end (ap);
 
-  o->v[o->c] = hcstrdup (buf);
+  if (rc == -1)
+  {
+    o->ovf = true;
+
+    return;
+  }
+
+  o->v[o->c] = option;
 
   o->c++;
 }
@@ -797,13 +804,24 @@ static void feed_optv_common (feed_optv_t *o, const hc_device_param_t *device_pa
   feed_optv_add (o, "-D HAS_SHFW=%u",     device_param->has_shfw);
 }
 
-// Where the #include lines resolve from. Three cases, all of them hashcat's, and the reason for the
-// third is that cpath_real is a POSIX path on a Cygwin or MSYS build while the compiler underneath
-// is native and cannot open one.
+// Native CUDA and HIP can use the executable-rooted path. OpenCL keeps its driver workaround, and
+// Cygwin and MSYS keep paths their native compilers can open.
 
 static void feed_optv_include_path (feed_optv_t *o, const folder_config_t *folder_config, MAYBE_UNUSED const hc_device_param_t *device_param, MAYBE_UNUSED const bool quote)
 {
-  #if defined (_WIN) || defined (__CYGWIN__) || defined (__MSYS__)
+  #if defined (_WIN)
+
+  if ((device_param->is_cuda == true) || (device_param->is_hip == true))
+  {
+    feed_optv_add (o, "-D INCLUDE_PATH=.");
+    feed_optv_add (o, "-I%s", folder_config->cpath_real);
+  }
+  else
+  {
+    feed_optv_add (o, "-D INCLUDE_PATH=%s", "OpenCL");
+  }
+
+  #elif defined (__CYGWIN__) || defined (__MSYS__)
 
   if (device_param->is_hip == true)
   {
@@ -974,7 +992,7 @@ static void feed_gpu_cache_write (const char *path, const void *buf, const size_
 {
   if (len == 0) return;
 
-  char tmp[1024];
+  char tmp[HCBUFSIZ_SMALL];
 
   snprintf (tmp, sizeof (tmp), "%s.tmp.%d", path, (int) FEED_GETPID ());
 
@@ -1011,7 +1029,7 @@ static char *feed_gpu_source_read (hashcat_ctx_t *hashcat_ctx, const char *kerne
 {
   const folder_config_t *folder_config = hashcat_ctx->folder_config;
 
-  char path[1024];
+  char path[HCBUFSIZ_SMALL];
 
   snprintf (path, sizeof (path), "%s/%s", folder_config->cpath_real, kernel_file);
 
@@ -1719,7 +1737,7 @@ feed_gpu_t *feed_gpu_init (hashcat_ctx_t *hashcat_ctx, const int device_id, cons
 
   if (o.ovf == true)
   {
-    snprintf (reason, reason_size, "the build options do not fit in %d entries of %d bytes", FEED_GPU_OPTV_MAX, 1024);
+    snprintf (reason, reason_size, "the build options are too long or exceed %d entries", FEED_GPU_OPTV_MAX);
 
     feed_optv_free (&o);
 
@@ -1734,7 +1752,7 @@ feed_gpu_t *feed_gpu_init (hashcat_ctx_t *hashcat_ctx, const int device_id, cons
 
   feed_gpu_cache_key (hashcat_ctx, device_param, desc->name, opts, source, source_len, key, sizeof (key));
 
-  char cache_file[1024];
+  char cache_file[HCBUFSIZ_SMALL];
 
   snprintf (cache_file, sizeof (cache_file), "%s/kernels/feed_%s.%s.kernel", folder_config->cache_dir, desc->name, key);
 

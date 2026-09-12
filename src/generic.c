@@ -59,9 +59,9 @@ char *generic_resolve (const folder_config_t *folder_config, const char *plugin_
 
   for (int i = 0; i < 3; i++)
   {
-    char *filename = (char *) hcmalloc (HCBUFSIZ_TINY);
+    char *filename = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
-    generic_filename (folder_config, plugin_name, prefixes[i], filename, HCBUFSIZ_TINY);
+    generic_filename (folder_config, plugin_name, prefixes[i], filename, HCBUFSIZ_SMALL);
 
     if (hc_path_read (filename) == true)
     {
@@ -483,7 +483,7 @@ static int generic_instance_init (hashcat_ctx_t *hashcat_ctx, generic_ctx_t *gen
 
   if (generic_ctx->dev_enable == true)
   {
-    char source_file[256];
+    char source_file[HCBUFSIZ_SMALL];
 
     generate_source_kernel_filename (false, hashcat_ctx->hashconfig->attack_exec, ATTACK_KERN_PCFG,
                                      hashcat_ctx->hashconfig->kern_type, hashcat_ctx->hashconfig->opti_type,

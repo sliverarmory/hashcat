@@ -905,7 +905,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
    * Load hcstats File
    */
 
-  char hcstat_tmp[256];
+  char hcstat_tmp[HCBUFSIZ_SMALL];
 
   if (hcstat == NULL)
   {

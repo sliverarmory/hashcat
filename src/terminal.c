@@ -1603,7 +1603,7 @@ void hash_info (hashcat_ctx_t *hashcat_ctx)
   }
   else
   {
-    char *modulefile = (char *) hcmalloc (HCBUFSIZ_TINY);
+    char *modulefile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
     if (user_options->machine_readable == true) printf ("{ ");
 
@@ -1611,7 +1611,7 @@ void hash_info (hashcat_ctx_t *hashcat_ctx)
     {
       user_options->hash_mode = i;
 
-      module_filename (folder_config, i, modulefile, HCBUFSIZ_TINY);
+      module_filename (folder_config, i, modulefile, HCBUFSIZ_SMALL);
 
       if (hc_path_exist (modulefile) == false) continue;
 

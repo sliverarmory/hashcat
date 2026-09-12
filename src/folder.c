@@ -40,9 +40,26 @@ static int get_exec_path (char *exec_path, const size_t exec_path_sz)
 
   #elif defined (_WIN)
 
-  memset (exec_path, 0, exec_path_sz);
+  DWORD len = GetModuleFileNameA (NULL, exec_path, (DWORD) exec_path_sz);
 
-  const int len = 0;
+  if ((len == 0) || (len >= exec_path_sz)) return -1;
+
+  // Extended paths reject the forward separators used for resource paths below.
+
+  const bool drive_letter = ((len > 5) && (((exec_path[4] >= 'a') && (exec_path[4] <= 'z')) || ((exec_path[4] >= 'A') && (exec_path[4] <= 'Z'))));
+
+  if (_strnicmp (exec_path, "\\\\?\\UNC\\", 8) == 0)
+  {
+    memmove (&exec_path[2], &exec_path[8], len - 7);
+
+    len -= 6;
+  }
+  else if ((strncmp (exec_path, "\\\\?\\", 4) == 0) && (drive_letter == true) && (exec_path[5] == ':'))
+  {
+    memmove (exec_path, &exec_path[4], len - 3);
+
+    len -= 4;
+  }
 
   #elif defined (__APPLE__)
 
@@ -357,7 +374,7 @@ int folder_config_init (hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED const char *ins
    * folders, as discussed on https://github.com/hashcat/hashcat/issues/20
    */
 
-  const size_t exec_path_sz = 1024;
+  const size_t exec_path_sz = HCBUFSIZ_TINY;
 
   char *exec_path = (char *) hcmalloc (exec_path_sz);
 

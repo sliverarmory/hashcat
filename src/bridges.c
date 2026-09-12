@@ -32,9 +32,9 @@ bool bridge_load (hashcat_ctx_t *hashcat_ctx, bridge_ctx_t *bridge_ctx, const ch
 {
   const folder_config_t *folder_config = hashcat_ctx->folder_config;
 
-  char *bridge_file = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *bridge_file = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
-  bridge_filename (folder_config, bridge_name, bridge_file, HCBUFSIZ_TINY);
+  bridge_filename (folder_config, bridge_name, bridge_file, HCBUFSIZ_SMALL);
 
   struct stat s;
 

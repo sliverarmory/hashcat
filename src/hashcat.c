@@ -2186,7 +2186,7 @@ int autodetect_hashmodes (hashcat_ctx_t *hashcat_ctx, usage_sort_t *usage_sort_b
 
   user_options->quiet = true;
 
-  char *modulefile = (char *) hcmalloc (HCBUFSIZ_TINY);
+  char *modulefile = (char *) hcmalloc (HCBUFSIZ_SMALL);
 
   if (modulefile == NULL) return -1;
 
@@ -2198,7 +2198,7 @@ int autodetect_hashmodes (hashcat_ctx_t *hashcat_ctx, usage_sort_t *usage_sort_b
 
     // this is just to find out of that hash-mode exists or not
 
-    module_filename (folder_config, i, modulefile, HCBUFSIZ_TINY);
+    module_filename (folder_config, i, modulefile, HCBUFSIZ_SMALL);
 
     if (hc_path_exist (modulefile) == false) continue;
 
