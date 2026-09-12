@@ -1134,7 +1134,7 @@ EMU_OBJS_ALL            += emu_inc_hash_md4 emu_inc_hash_md5 emu_inc_hash_ripemd
 EMU_OBJS_ALL            += emu_inc_cipher_aes emu_inc_cipher_camellia emu_inc_cipher_des emu_inc_cipher_kuznyechik emu_inc_cipher_serpent emu_inc_cipher_twofish
 EMU_OBJS_ALL            += emu_inc_hash_base58
 
-OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvapi ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface keyboard_layout locking logfile loopback memchr memory monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe restore rp rp_cpu selftest slow_candidates shared status stdout straight generic system terminal thread timer tuningdb usage user_options wordlist $(EMU_OBJS_ALL)
+OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface keyboard_layout locking logfile loopback memchr memory monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe restore rp rp_cpu selftest slow_candidates shared status stdout straight generic system terminal thread timer tuningdb usage user_options wordlist $(EMU_OBJS_ALL)
 
 ifeq ($(ENABLE_BRAIN),1)
 OBJS_ALL                += brain
@@ -1196,6 +1196,8 @@ TOOLS                   += $(wildcard tools/*hashcat.py)
 ##
 ## A fragment may still declare a rule of its own. An explicit rule beats the pattern rules below
 ## whatever order they are read in.
+
+include src/rust_toolchain.mk
 
 include $(wildcard src/modules/*.mk)
 include $(wildcard src/bridges/*.mk)
@@ -1591,7 +1593,9 @@ clean:
 	$(RM) -f core
 	$(RM) -rf *.induct
 	$(RM) -rf *.outfiles
+	$(RM) -rf cache
 	$(RM) -rf kernels
+	$(RM) -rf seekdbs
 	$(RM) -rf pcfgdbs
 	$(RM) -rf Rust/bridges/*/target
 	$(RM) -rf Rust/feeds/*/target
@@ -1683,9 +1687,9 @@ install_docs: install_make_shared_root
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/charsets
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/docs
-	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/layouts
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/masks
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/rules
+	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/tables
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/extra
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(DOCUMENT_FOLDER)/extra/tab_completion
 	$(INSTALL) -m 644 example.dict                                          $(DESTDIR)$(DOCUMENT_FOLDER)/
@@ -1702,12 +1706,12 @@ install_docs: install_make_shared_root
 	$(FIND) charsets/ -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) docs/     -type d -exec $(INSTALL) -m 755 -d                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) docs/     -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
-	$(FIND) layouts/  -type d -exec $(INSTALL) -m 755 -d                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
-	$(FIND) layouts/  -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) masks/    -type d -exec $(INSTALL) -m 755 -d                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) masks/    -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) rules/    -type d -exec $(INSTALL) -m 755 -d                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(FIND) rules/    -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
+	$(FIND) tables/   -type d -exec $(INSTALL) -m 755 -d                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
+	$(FIND) tables/   -type f -exec $(INSTALL) -m 644 {}                    $(DESTDIR)$(DOCUMENT_FOLDER)/{} \;
 	$(SED) $(SED_IN_PLACE) 's/\.\/hashcat/hashcat/'                         $(DESTDIR)$(DOCUMENT_FOLDER)/example0.sh
 	$(SED) $(SED_IN_PLACE) 's/\.\/hashcat/hashcat/'                         $(DESTDIR)$(DOCUMENT_FOLDER)/example400.sh
 	$(SED) $(SED_IN_PLACE) 's/\.\/hashcat/hashcat/'                         $(DESTDIR)$(DOCUMENT_FOLDER)/example500.sh

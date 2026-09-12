@@ -1,23 +1,23 @@
 
 # Hashcat Build Documentation
 
-**Revision**: 1.7  
+**Revision**: 1.8  
 **Author**: See `docs/credits.txt`
 
 ---
 
 ## Requirements
 
-- **Python 3.12** or higher
+- **Python 3.13** or higher
 
 Check your Python version:
 
 ```bash
 $ python3 --version
-# Expected output: Python 3.13.9
+# Expected output: Python 3.14.7
 ```
 
-If you can't install Python >= 3.12 globally, you can use **pyenv**.
+If you can't install Python >= 3.13 globally, you can use **pyenv**.
 
 > If you're using `pyenv`, follow **all steps** below. Otherwise, follow only **steps 3 and 5**.
 
@@ -55,10 +55,10 @@ $ brew install pyenv
 
 ### Step 2: Install Python using pyenv
 
-Install Python 3.12 (or newer):
+Install Python 3.13 (or newer):
 
 ```bash
-$ pyenv install 3.12
+$ pyenv install 3.14.7
 ```
 
 Check installed versions:
@@ -67,7 +67,7 @@ Check installed versions:
 $ pyenv versions
 # Example:
 # * system
-#   3.12.11
+#   3.14.7
 ```
 
 ---
@@ -84,7 +84,7 @@ $ cd hashcat
 ### Step 4: Set the local Python version
 
 ```bash
-$ pyenv local 3.12.11
+$ pyenv local 3.14.7
 ```
 
 ---
@@ -127,10 +127,10 @@ Hashcat will use the following locations depending on your environment:
 
 | Condition                                   | Session Files                          | Kernel Cache                          | Potfiles                              |
 |--------------------------------------------|----------------------------------------|---------------------------------------|----------------------------------------|
-| `$XDG_DATA_HOME` and `$XDG_CACHE_HOME` set | `$XDG_DATA_HOME/hashcat/sessions/`     | `$XDG_CACHE_HOME/hashcat/kernels/`    | `$XDG_DATA_HOME/hashcat/`              |
-| Only `$XDG_DATA_HOME` set                  | `$XDG_DATA_HOME/hashcat/sessions/`     | `$HOME/.cache/hashcat/`               | `$XDG_DATA_HOME/hashcat/`              |
-| Only `$XDG_CACHE_HOME` set                 | `$HOME/.local/share/hashcat/sessions/` | `$XDG_CACHE_HOME/hashcat/kernels/`    | `$HOME/.local/share/hashcat/`          |
-| None of the above                          | `$HOME/.local/share/hashcat/sessions/` | `$HOME/.cache/hashcat/`               | `$HOME/.local/share/hashcat/`          |
+| `$XDG_DATA_HOME` and `$XDG_CACHE_HOME` set | `$XDG_DATA_HOME/hashcat/sessions/`     | `$XDG_CACHE_HOME/hashcat/cache/kernels/`    | `$XDG_DATA_HOME/hashcat/`              |
+| Only `$XDG_DATA_HOME` set                  | `$XDG_DATA_HOME/hashcat/sessions/`     | `$HOME/.cache/hashcat/cache/`               | `$XDG_DATA_HOME/hashcat/`              |
+| Only `$XDG_CACHE_HOME` set                 | `$HOME/.local/share/hashcat/sessions/` | `$XDG_CACHE_HOME/hashcat/cache/kernels/`    | `$HOME/.local/share/hashcat/`          |
+| None of the above                          | `$HOME/.local/share/hashcat/sessions/` | `$HOME/.cache/hashcat/cache/`               | `$HOME/.local/share/hashcat/`          |
 
 ---
 ## Building Hashcat for Android

@@ -94,7 +94,6 @@ static bool generic_global_init (hashcat_ctx_t *hashcat_ctx, generic_ctx_t *gene
 
   generic_ctx->global_ctx.cache_dir   = folder_config->cache_dir;
   generic_ctx->global_ctx.profile_dir = folder_config->profile_dir;
-  generic_ctx->global_ctx.seekdb_dir  = user_options->seekdb_path;
   generic_ctx->global_ctx.shared_dir  = folder_config->shared_dir;
 
   // ok we can also add hashcat_ctx, which might be hard to bind, but we make it optional
@@ -323,6 +322,7 @@ static int generic_instance_init (hashcat_ctx_t *hashcat_ctx, generic_ctx_t *gen
   generic_ctx->iconv_enable   = (*generic_plugin_options & GENERIC_PLUGIN_OPTIONS_ICONV)   ? true : false;
   generic_ctx->rules_enable   = (*generic_plugin_options & GENERIC_PLUGIN_OPTIONS_RULES)   ? true : false;
   generic_ctx->dev_enable     = (*generic_plugin_options & GENERIC_PLUGIN_OPTIONS_DEVICE)     ? true : false;
+  generic_ctx->explain_enable = (*generic_plugin_options & GENERIC_PLUGIN_OPTIONS_EXPLAIN)    ? true : false;
 
   const bool dev_offered = generic_ctx->dev_enable;
 
@@ -342,6 +342,35 @@ static int generic_instance_init (hashcat_ctx_t *hashcat_ctx, generic_ctx_t *gen
   {
     HC_LOAD_FUNC_GENERIC (generic_ctx, global_dev_init, GENERIC_GLOBAL_DEV_INIT);
     HC_LOAD_FUNC_GENERIC (generic_ctx, thread_next_dev, GENERIC_THREAD_NEXT_DEV);
+  }
+
+  // Whether this feed can answer the question --debug-mode asks. The option is checked for shape when
+  // the command line is read, but nothing had opened the feed by then, so this is where a feed that
+  // cannot explain itself is reported rather than quietly writing nothing.
+  //
+  // Mode 6 always asks the feed. Modes 1, 3, 4 and 5 ask it only when the run has no rules, because
+  // then there is no rule for them to name and the feed is the only thing that can fill the field.
+  // Mode 2 writes the base word alone, so it never needs an answer.
+
+  const user_options_t *user_options = hashcat_ctx->user_options;
+
+  const u32 debug_mode = user_options->debug_mode;
+
+  const bool wants_rule = (debug_mode == 1) || (debug_mode == 3) || (debug_mode == 4) || (debug_mode == 5);
+  const bool no_rules = (user_options->rp_files_cnt == 0) && (user_options->rp_gen == 0);
+
+  const bool asks_feed = (debug_mode == DEBUG_MODE_FEED) || ((wants_rule == true) && (no_rules == true));
+
+  if ((asks_feed == true) && (generic_ctx->explain_enable == false))
+  {
+    event_log_error (hashcat_ctx, "%s: this feed cannot say how it made a candidate, so --debug-mode %u has nothing to write.", generic_ctx->plugin_name, debug_mode);
+
+    return -1;
+  }
+
+  if (generic_ctx->explain_enable == true)
+  {
+    HC_LOAD_FUNC_GENERIC (generic_ctx, global_explain, GENERIC_GLOBAL_EXPLAIN);
   }
 
   // Whether the device engine is going to be used, settled here and nowhere else.

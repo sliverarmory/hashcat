@@ -829,6 +829,11 @@ typedef enum user_options_defaults
   #endif
   COLOR_CRACKED            = false,
   DEBUG_MODE               = 0,
+
+  // The highest --debug-mode value, and the one that asks the feed rather than the rules engine what
+  // made a candidate. 1 to 5 report a rule, which an attack with no rules has none of.
+
+  DEBUG_MODE_FEED          = 6,
   DEPRECATED_CHECK         = true,
   DYNAMIC_X                = false,
   FORCE                    = false,
@@ -1040,7 +1045,7 @@ typedef enum user_options_map
   IDX_RULE_BUF_R                = 'k',
   IDX_RUNTIME                   = 0xff43,
   IDX_SCRYPT_TMTO               = 0xff44,
-  IDX_SEEKDB_PATH               = 0xff88,
+  IDX_CACHE_PATH                = 0xff88,
   IDX_SELF_TEST_DISABLE         = 0xff45,
   IDX_SEPARATOR                 = 'p',
   IDX_SESSION                   = 0xff46,
@@ -1679,11 +1684,18 @@ typedef struct hc_device_param
   u64  size_combs_c;
 
   // The device engine's two buffers. The cells are per work item and are rewritten every launch beside
-  // pws_buf; the pool is the terminal bytes every cell indexes into and is uploaded once.
+  // pws_buf. The pool is the terminal bytes every cell indexes into, and it is handed over once.
 
   u64  size_pcfg_cells;
   u64  size_pcfg_pool;
   u64  size_pcfg_wmap;
+
+  // One buffer where the device will allocate the pool in one, equal parts where it will not. A part
+  // is a whole number of pages, not a power of two: see pcfg_pool_budget ().
+
+  u64  size_pcfg_pool_part;
+  u32  pcfg_pool_parts;
+
   u64  size_rules;
   u64  size_rules_c;
   u64  size_root_css;
@@ -1936,7 +1948,7 @@ typedef struct hc_device_param
   CUdeviceptr       cuda_d_combs;
   CUdeviceptr       cuda_d_combs_c;
   CUdeviceptr       cuda_d_pcfg_cells;
-  CUdeviceptr       cuda_d_pcfg_pool;
+  CUdeviceptr       cuda_d_pcfg_pool[PCFG_POOL_PARTS];
   CUdeviceptr       cuda_d_pcfg_wmap;
   CUdeviceptr       cuda_d_bfs;
   CUdeviceptr       cuda_d_bfs_c;
@@ -2022,7 +2034,7 @@ typedef struct hc_device_param
   hipDeviceptr_t    hip_d_combs;
   hipDeviceptr_t    hip_d_combs_c;
   hipDeviceptr_t    hip_d_pcfg_cells;
-  hipDeviceptr_t    hip_d_pcfg_pool;
+  hipDeviceptr_t    hip_d_pcfg_pool[PCFG_POOL_PARTS];
   hipDeviceptr_t    hip_d_pcfg_wmap;
   hipDeviceptr_t    hip_d_bfs;
   hipDeviceptr_t    hip_d_bfs_c;
@@ -2146,7 +2158,7 @@ typedef struct hc_device_param
   mtl_mem_t         metal_d_combs;
   mtl_mem_t         metal_d_combs_c;
   mtl_mem_t         metal_d_pcfg_cells;
-  mtl_mem_t         metal_d_pcfg_pool;
+  mtl_mem_t         metal_d_pcfg_pool[PCFG_POOL_PARTS];
   mtl_mem_t         metal_d_pcfg_wmap;
   mtl_mem_t         metal_d_bfs;
   mtl_mem_t         metal_d_bfs_c;
@@ -2246,7 +2258,7 @@ typedef struct hc_device_param
   cl_mem            opencl_d_combs;
   cl_mem            opencl_d_combs_c;
   cl_mem            opencl_d_pcfg_cells;
-  cl_mem            opencl_d_pcfg_pool;
+  cl_mem            opencl_d_pcfg_pool[PCFG_POOL_PARTS];
   cl_mem            opencl_d_pcfg_wmap;
   cl_mem            opencl_d_bfs;
   cl_mem            opencl_d_bfs_c;
@@ -2399,7 +2411,6 @@ typedef struct backend_ctx
 
   bool                need_adl;
   bool                need_nvml;
-  bool                need_nvapi;
   bool                need_sysfs_amdgpu;
   bool                need_sysfs_intelgpu;
   bool                need_sysfs_cpu;
@@ -2473,7 +2484,6 @@ typedef enum kernel_workload
 } kernel_workload_t;
 
 #include "ext_ADL.h"
-#include "ext_nvapi.h"
 #include "ext_nvml.h"
 #include "ext_sysfs_amdgpu.h"
 #include "ext_sysfs_intelgpu.h"
@@ -2484,7 +2494,6 @@ typedef struct hm_attrs
 {
   HM_ADAPTER_ADL            adl;
   HM_ADAPTER_NVML           nvml;
-  HM_ADAPTER_NVAPI          nvapi;
   HM_ADAPTER_SYSFS_AMDGPU   sysfs_amdgpu;
   HM_ADAPTER_SYSFS_INTELGPU sysfs_intelgpu;
   HM_ADAPTER_SYSFS_CPU      sysfs_cpu;
@@ -2513,7 +2522,6 @@ typedef struct hwmon_ctx
 
   void *hm_adl;
   void *hm_nvml;
-  void *hm_nvapi;
   void *hm_sysfs_amdgpu;
   void *hm_sysfs_intelgpu;
   void *hm_sysfs_cpu;
@@ -2929,7 +2937,7 @@ typedef struct user_options
   char        *restore_file_path;
   char       **rp_files;
   char        *rp_gen_func_sel;
-  char        *seekdb_path;
+  char        *cache_path;
   char        *separator;
   char        *truecrypt_keyfiles;
   char        *veracrypt_keyfiles;
@@ -3335,17 +3343,6 @@ typedef struct generic_global_ctx
   char  *profile_dir;
   char  *cache_dir;
 
-  // Where seek databases live, when the user named a directory with --seekdb-path. NULL means the
-  // feed picks its own place under cache_dir, which is what happens without the option.
-  //
-  // It is here because a database is described entirely by the wordlist it was built from, so one
-  // built on any machine is usable on every machine that reads the same file, and pointing a whole
-  // cluster at one shared directory turns a build per machine into a build for all of them. The
-  // directory may be read only: a feed writes only when it did not find what it needed, and a write
-  // that fails leaves it running from the database it just built in memory.
-
-  char  *seekdb_dir;
-
   // Where hashcat keeps the files it ships. A feed that carries data of its own finds it here, the
   // same way the frontend finds the feed itself: shared_dir/feeds is what was searched to load this
   // plugin, so shared_dir/<something> is where anything shipped beside it lives.
@@ -3464,6 +3461,7 @@ typedef bool (*GENERIC_THREAD_INIT)     (generic_global_ctx_t *, generic_thread_
 typedef void (*GENERIC_THREAD_TERM)     (generic_global_ctx_t *, generic_thread_ctx_t *);
 typedef int  (*GENERIC_THREAD_NEXT)     (generic_global_ctx_t *, generic_thread_ctx_t *, u8 *, const int);
 typedef int  (*GENERIC_THREAD_NEXT_DEV) (generic_global_ctx_t *, generic_thread_ctx_t *, u8 *, const int, pcfg_cell_t *);
+typedef int  (*GENERIC_GLOBAL_EXPLAIN)   (generic_global_ctx_t *, const pcfg_cell_t *, const u32 *, const u8 *, const int, const u32, char *, const int);
 typedef bool (*GENERIC_THREAD_SEEK)     (generic_global_ctx_t *, generic_thread_ctx_t *, const u64);
 typedef bool (*GENERIC_GLOBAL_DEV_INIT) (generic_global_ctx_t *, const u32 **, u64 *, u32 *, u32 *, u32 *, u32 *, u32 *, u32 *, pcfg_cell_t *);
 
@@ -3529,14 +3527,17 @@ typedef struct generic_ctx
 
   GENERIC_GLOBAL_DEV_INIT  global_dev_init;
   GENERIC_THREAD_NEXT_DEV  thread_next_dev;
+  GENERIC_GLOBAL_EXPLAIN   global_explain;
 
   bool autohex_enable;
   bool iconv_enable;
   bool rules_enable;
   bool dev_enable;
+  bool explain_enable;
 
   // What global_dev_init () handed over: the terminal pool every cell indexes into, and how wide the
-  // device side inner loop is. The pool is read only and uploaded once per device.
+  // device side inner loop is. The pool is read only, and a device whose memory is the host's reads
+  // these bytes rather than a copy, so the buffers over it are released before the feed frees it.
 
   const u32 *dev_pool;
   u64        dev_pool_size;
