@@ -188,14 +188,7 @@ if [ "$platform" = "windows" ]; then
     exit 1
   fi
 
-  if ! strings "$binary" | tr -d '\r' | awk -v expected="$EXPECTED_VERSION" '
-    $0 == expected { found = 1 }
-    END { exit found ? 0 : 1 }
-  '; then
-    echo "! the Windows binary does not contain the expected version: $EXPECTED_VERSION"
-    exit 1
-  fi
-
+  # The native Windows job verifies this version before publication.
   binary_version="$EXPECTED_VERSION"
 else
   binary_version="$(HASHCAT_MODULE_CACHE_DISABLE=1 "$binary" --version)"
