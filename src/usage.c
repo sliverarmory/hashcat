@@ -9,6 +9,7 @@
 #include "shared.h"
 #include "path.h"
 #include "interface.h"
+#include "module_options.h"
 #include "usage.h"
 
 static const char *const USAGE_MINI[] =
@@ -19,6 +20,13 @@ static const char *const USAGE_MINI[] =
   NULL
 };
 
+// Where --help lists the options the modules registered, see module_options_usage (). The table has no
+// rows of its own for them, because which hash-modes read them is up to the modules. The marker is
+// found by its text, not by its address: a toolchain that folds identical constants, as clang with
+// LTO does, can give an empty marker the address of every blank line in the table.
+
+static const char USAGE_MODULE_OPTIONS[] = "<module options>";
+
 static const char *const USAGE_BIG_PRE_HASHMODES[] =
 {
   "Usage: hashcat [options]... hash|hashfile|hccapxfile [dictionary|mask|directory]...",
@@ -28,6 +36,7 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   " Options Short / Long           | Type | Description                                          | Example",
   "================================+======+======================================================+=======================",
   " -m, --hash-type                | Num  | Hash-type, references below (otherwise autodetect)   | -m 1000",
+  "     --hash-recipe              | Str  | Hash recipe for hash-mode 4000                       | --hash-recipe 'md5(md5(salt) . pass)'",
   " -a, --attack-mode              | Num  | Attack-mode, see references below                    | -a 3",
   " -V, --version                  |      | Print version                                        |",
   " -h, --help                     |      | Print help. Use -hh to show all supported hash-modes | -h or -hh",
@@ -41,7 +50,9 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   "     --task-time-breakdown     |      | Show where the run's wall clock went, by stage       |",
   "     --status                   |      | Enable automatic update of the status screen         |",
   "     --status-json              |      | Enable JSON format for status output                 |",
+  "     --json                     |      | Enable JSON format for all output                    |",
   "     --status-timer             | Num  | Sets seconds between status screen updates to X      | --status-timer=1",
+  "     --stdin-count              | Num  | Expected number of lines on stdin, for the ETA       | --stdin-count=1000000",
   "     --stdin-timeout-abort      | Num  | Abort if there is no input from stdin for X seconds  | --stdin-timeout-abort=300",
   "     --machine-readable         |      | Display the status view in a machine-readable format |",
   "     --keep-guessing            |      | Keep guessing the hash after it has been cracked     |",
@@ -83,17 +94,13 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   "     --outfile-check-dir        | Dir  | Specify the directory to monitor 3rd party outfiles  | --outfile-check-dir=x",
   "     --cache-path               | Dir  | Specify the directory hashcat caches everything in   | --cache-path=/mnt/hccache",
   "     --logfile-disable          |      | Disable the logfile                                  |",
-  "     --hccapx-message-pair      | Num  | Load only message pairs from hccapx matching X       | --hccapx-message-pair=2",
-  "     --nonce-error-corrections  | Num  | The BF size range to replace AP's nonce last bytes   | --nonce-error-corrections=16",
-  "     --keyboard-layout-mapping  | File | Keyboard layout mapping table for special hash-modes | --keyb=tables/layouts/de.table",
-  "     --truecrypt-keyfiles       | File | Keyfiles to use, separated with commas               | --truecrypt-keyf=x.png",
-  "     --veracrypt-keyfiles       | File | Keyfiles to use, separated with commas               | --veracrypt-keyf=x.txt",
-  "     --veracrypt-pim-start      | Num  | VeraCrypt personal iterations multiplier start       | --veracrypt-pim-start=450",
-  "     --veracrypt-pim-stop       | Num  | VeraCrypt personal iterations multiplier stop        | --veracrypt-pim-stop=500",
+  USAGE_MODULE_OPTIONS,
   " -b, --benchmark                |      | Run benchmark of selected hash-modes                 |",
+  " -B, --benchmark-pure           |      | Run benchmark of selected hash-modes, pure kernels   |",
   "     --benchmark-all            |      | Run benchmark of all hash-modes (requires -b)        |",
-  "     --benchmark-min            |      | Set benchmark min hash-mode (requires -b)            | --benchmark-min=100",
-  "     --benchmark-max            |      | Set benchmark max hash-mode (requires -b)            | --benchmark-max=1000",
+  "     --benchmark-json           |      | Enable JSON format for benchmark output              |",
+  "     --benchmark-min            | Num  | Set benchmark min hash-mode (requires -b)            | --benchmark-min=100",
+  "     --benchmark-max            | Num  | Set benchmark max hash-mode (requires -b)            | --benchmark-max=1000",
   "     --speed-only               |      | Return expected speed of the attack, then quit       |",
   "     --progress-only            |      | Return ideal progress step size and time to process  |",
   "     --bitmap-min               | Num  | Sets minimum bits allowed for bitmaps to X           | --bitmap-min=24",
@@ -121,10 +128,10 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   " -u, --kernel-loops             | Num  | Manual workload tuning, set innerloop step size to X | -u 256",
   " -T, --kernel-threads           | Num  | Manual workload tuning, set thread count to X        | -T 64",
   "     --backend-vector-width     | Num  | Manually override backend vector-width to X          | --backend-vector-width=4",
+  "     --length-sort-disable      |      | Disable ordering candidates by password length       |",
   "     --spin-damp                | Num  | Use CPU for device synchronization, in percent       | --spin-damp=10",
   "     --hwmon-disable            |      | Disable temperature and fanspeed reads and triggers  |",
   "     --hwmon-temp-abort         | Num  | Abort if temperature reaches X degrees Celsius       | --hwmon-temp-abort=100",
-  "     --scrypt-tmto              | Num  | Manually override TMTO value for scrypt to X         | --scrypt-tmto=3",
   " -s, --skip                     | Num  | Skip X words from the start                          | -s 1000000",
   " -l, --limit                    | Num  | Limit X words from the start + skipped words         | -l 1000000",
   "     --keyspace                 |      | Show keyspace base:mod values and quit               |",
@@ -133,6 +140,7 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   " -j, --rule-left                | Rule | Single rule applied to each word from left wordlist  | -j 'c'",
   " -k, --rule-right               | Rule | Single rule applied to each word from right wordlist | -k '^-'",
   " -r, --rules-file               | File | Multiple rules applied to each word from wordlists   | -r rules/best66.rule",
+  "     --rules-concat             |      | Use the -r files as one list instead of chaining them |",
   " -g, --generate-rules           | Num  | Generate X random rules                              | -g 10000",
   "     --generate-rules-func-min  | Num  | Force min X functions per rule                       |",
   "     --generate-rules-func-max  | Num  | Force max X functions per rule                       |",
@@ -157,7 +165,7 @@ static const char *const USAGE_BIG_PRE_HASHMODES[] =
   #ifdef WITH_BRAIN
   "     --brain-server             |      | Enable brain server                                  |",
   "     --brain-server-timer       | Num  | Update the brain server dump each X seconds (min:60) | --brain-server-timer=300",
-  " -z, --brain-client             |      | Enable brain client, activates -S                    |",
+  " -z, --brain-client             |      | Enable brain client, activates -S unless features=2  |",
   "     --brain-feed               |      | Hash stdin into a running brain, needs --brain-session|",
   "     --brain-client-features    | Num  | Define brain client features, see below              | --brain-client-features=3",
   "     --brain-host               | Str  | Brain server host (IP or domain)                     | --brain-host=127.0.0.1",
@@ -202,6 +210,10 @@ static const char *const USAGE_BIG_POST_HASHMODES[] =
   "  1 | Send hashed passwords",
   "  2 | Send attack positions",
   "  3 | Send hashed passwords and attack positions",
+  "",
+  "Feature 1 needs every candidate on the host and therefore activates -S. Feature 2 works from",
+  "keyspace positions alone, so --brain-client-features=2 leaves candidate generation on the",
+  "device. That is the one to use for a fast hash.",
   "",
   #endif
   "- [ Outfile Formats ] -",
@@ -377,6 +389,15 @@ void usage_big_print (hashcat_ctx_t *hashcat_ctx)
 
       if (hc_path_exist (modulefile) == false) continue;
 
+      // an old number loads the module of its new number, so a module file left under it by an
+      // earlier build or install would list the hash-mode twice
+
+      if (module_hash_mode_resolve ((u32) i) != (u32) i) continue;
+
+      // a module that could not be loaded was reported when the options were collected
+
+      if (module_options_broken (user_options, (u32) i) == true) continue;
+
       const int rc = hashconfig_init (hashcat_ctx);
 
       if (rc == 0)
@@ -398,6 +419,13 @@ void usage_big_print (hashcat_ctx_t *hashcat_ctx)
 
   for (int i = 0; USAGE_BIG_PRE_HASHMODES[i] != NULL; i++)
   {
+    if (strcmp (USAGE_BIG_PRE_HASHMODES[i], USAGE_MODULE_OPTIONS) == 0)
+    {
+      module_options_usage (user_options);
+
+      continue;
+    }
+
     printf ("%s", USAGE_BIG_PRE_HASHMODES[i]);
 
     fwrite (EOL, strlen (EOL), 1, stdout);

@@ -184,14 +184,7 @@ KERNEL_FQ KERNEL_FA void m22500_m04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32x comb_off = COMBS_PRE_LEN + pw_l_len;
 
@@ -607,12 +600,6 @@ KERNEL_FQ KERNEL_FA void m22500_m04 (KERN_ATTR_BASIC ())
      * AES-256-CBC:
      */
 
-    #define KEYLEN 60
-
-    u32 ks[KEYLEN];
-
-    aes256_set_decrypt_key_inv (ks, ukey, s_te0, s_te1, s_te2, s_te3, s_inv0, s_inv1, s_inv2, s_inv3);
-
     u32 encrypted[4];
 
     encrypted[0] = data[0];
@@ -622,7 +609,7 @@ KERNEL_FQ KERNEL_FA void m22500_m04 (KERN_ATTR_BASIC ())
 
     u32 out[4];
 
-    aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+    aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
     out[0] ^= iv[0];
 
@@ -666,7 +653,7 @@ KERNEL_FQ KERNEL_FA void m22500_m04 (KERN_ATTR_BASIC ())
       encrypted[2] = data[6];
       encrypted[3] = data[7];
 
-      aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+      aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
       out[0] ^= iv[0];
       out[1] ^= iv[1];
@@ -720,7 +707,7 @@ KERNEL_FQ KERNEL_FA void m22500_m04 (KERN_ATTR_BASIC ())
       encrypted[2] = data[6];
       encrypted[3] = data[7];
 
-      aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+      aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
       out[0] ^= iv[0];
       out[1] ^= iv[1];
@@ -906,14 +893,7 @@ KERNEL_FQ KERNEL_FA void m22500_s04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32x comb_off = COMBS_PRE_LEN + pw_l_len;
 
@@ -1329,12 +1309,6 @@ KERNEL_FQ KERNEL_FA void m22500_s04 (KERN_ATTR_BASIC ())
      * AES-256-CBC:
      */
 
-    #define KEYLEN 60
-
-    u32 ks[KEYLEN];
-
-    aes256_set_decrypt_key_inv (ks, ukey, s_te0, s_te1, s_te2, s_te3, s_inv0, s_inv1, s_inv2, s_inv3);
-
     u32 encrypted[4];
 
     encrypted[0] = data[0];
@@ -1344,7 +1318,7 @@ KERNEL_FQ KERNEL_FA void m22500_s04 (KERN_ATTR_BASIC ())
 
     u32 out[4];
 
-    aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+    aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
     out[0] ^= iv[0];
 
@@ -1388,7 +1362,7 @@ KERNEL_FQ KERNEL_FA void m22500_s04 (KERN_ATTR_BASIC ())
       encrypted[2] = data[6];
       encrypted[3] = data[7];
 
-      aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+      aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
       out[0] ^= iv[0];
       out[1] ^= iv[1];
@@ -1442,7 +1416,7 @@ KERNEL_FQ KERNEL_FA void m22500_s04 (KERN_ATTR_BASIC ())
       encrypted[2] = data[6];
       encrypted[3] = data[7];
 
-      aes256_decrypt (ks, encrypted, out, s_td0, s_td1, s_td2, s_td3, s_td4);
+      aes256_decrypt_cs (ukey, encrypted, out, s_te4, s_td0, s_td1, s_td2, s_td3, s_td4, s_inv0, s_inv1, s_inv2, s_inv3);
 
       out[0] ^= iv[0];
       out[1] ^= iv[1];

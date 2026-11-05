@@ -22,7 +22,7 @@ hashcat.dll
 cache/**
 
 # the layout before everything rebuildable moved under cache/, left here so an older checkout
-# does not report them as untracked. Removable once nobody is upgrading across that change.
+# does not report them as untracked. Removable once no one is upgrading across that change.
 kernels/**
 seekdbs/**
 pcfgdbs/**
@@ -68,8 +68,18 @@ test_edge*
 comgr-*/
 *.hipi
 
+# tools/compute_sanitizer: the DEBUG=1 sibling binary, per-run results
+# (never overwritten, so never something to commit), and the compiled
+# ground-truth .cu fixtures (source is tracked, the nvcc-built binaries are not).
+/hashcat-sanitizer
+/tools/compute_sanitizer/results/
+/tools/compute_sanitizer/modules/oob_write
+/tools/compute_sanitizer/modules/oob_read
+/tools/compute_sanitizer/modules/uninit_global
+
 Rust/feeds/*/target
 Rust/bridges/*/target
+Rust/hashcat-sys/target
 
 # Left behind by builds from before the bindings moved into OUT_DIR
 Rust/hashcat-sys/src/bindings.rs
@@ -83,3 +93,21 @@ __pycache__/
 /docs/hashcat-example_hashes.md
 /docs/hashcat-help.md
 
+# ASan tooling output (tools/asan/)
+/asan_harness
+/asan-sweep/
+/asan-gpu-sweep/
+/asan-repro/
+
+# fuzzing output (tools/fuzz/)
+/fuzz_out/
+/corpus/
+/crashes/
+
+# The ZC706 SD boot image is build output, not a source file. make_bootbin.py writes it here by
+# default. It is a 13 MB bitstream in a padded container and belongs to one specific design, so it
+# cannot be shipped. Build your own image from the bitstream you intend to use.
+#
+# The *.bin pattern above does not match this file. .gitignore patterns are case-sensitive, and the
+# filename is BOOT.BIN.
+/extra/fpga/zc706-sdboot/BOOT.BIN

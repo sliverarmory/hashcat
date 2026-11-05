@@ -146,14 +146,7 @@ KERNEL_FQ KERNEL_FA void m04710_m04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32x comb_off = COMBS_PRE_LEN + pw_l_len;
 
@@ -560,7 +553,7 @@ KERNEL_FQ KERNEL_FA void m04710_m04 (KERN_ATTR_BASIC ())
 
     const u32 c0 = (off & 15) / 4;
 
-    const u32 r0 = 0xff << ((off & 3) * 8);
+    const u32 r0 = 0xffu << ((off & 3) * 8);
 
     const u32 m0[4] = { ((c0 == 0) ? r0 : 0), ((c0 == 1) ? r0 : 0), ((c0 == 2) ? r0 : 0), ((c0 == 3) ? r0 : 0) };
 
@@ -968,14 +961,7 @@ KERNEL_FQ KERNEL_FA void m04710_s04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32x comb_off = COMBS_PRE_LEN + pw_l_len;
 
@@ -1382,7 +1368,7 @@ KERNEL_FQ KERNEL_FA void m04710_s04 (KERN_ATTR_BASIC ())
 
     const u32 c0 = (off & 15) / 4;
 
-    const u32 r0 = 0xff << ((off & 3) * 8);
+    const u32 r0 = 0xffu << ((off & 3) * 8);
 
     const u32 m0[4] = { ((c0 == 0) ? r0 : 0), ((c0 == 1) ? r0 : 0), ((c0 == 2) ? r0 : 0), ((c0 == 3) ? r0 : 0) };
 

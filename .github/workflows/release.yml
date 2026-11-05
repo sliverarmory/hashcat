@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 concurrency:
   group: release-binaries-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
@@ -31,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          expected_version="$(make -s version | tail -1)"
+          expected_version="$(make -s PRODUCTION=0 version | tail -1)"
           source_date_epoch="$(git show -s --format=%ct HEAD)"
 
           case "$expected_version" in
@@ -173,7 +176,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          EXPECTED_VERSION="$(make -s version | tail -1)"
+          EXPECTED_VERSION="$(make -s PRODUCTION=0 version | tail -1)"
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export EXPECTED_VERSION SOURCE_DATE_EPOCH
 
@@ -187,7 +190,7 @@ jobs:
           fi
 
           make clean
-          make ENABLE_LTO=0 MAINTAINER_MODE=1 CC=clang CXX=clang++
+          make "VERSION_TAG=$EXPECTED_VERSION" ENABLE_LTO=0 MAINTAINER_MODE=1 CC=clang CXX=clang++
           bash tools/test_package.sh . --no-device
 
           {
@@ -302,7 +305,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          expected_version="$(make -s version | tail -1)"
+          expected_version="$(make -s PRODUCTION=0 version | tail -1)"
           mkdir -p release-verify
           unzip -q release/hashcat-windows_amd64.zip -d release-verify
           chmod 755 release-verify/hashcat.exe

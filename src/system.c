@@ -44,7 +44,7 @@
 #include <sys/sysinfo.h>
 #endif
 #endif
-void setup_environment_variables (const folder_config_t *folder_config, const user_options_t *user_options)
+void setup_environment_variables (const folder_config_t *folder_config)
 {
   char *compute = getenv ("COMPUTE");
 
@@ -86,10 +86,6 @@ void setup_environment_variables (const folder_config_t *folder_config, const us
     // we can't free tmpdir at this point!
   }
 
-  if (user_options->hash_mode == 72000) // ugly but rare hack, we might move this to modules at a later stage
-    if (getenv ("PYTHON_GIL") == NULL)
-     putenv ((char *) "PYTHON_GIL=0");
-
   #if defined (__CYGWIN__)
   cygwin_internal (CW_SYNC_WINENV);
   #endif
@@ -102,16 +98,29 @@ void setup_umask (void)
 
 void setup_seeding (const bool rp_gen_seed_chgd, const u32 rp_gen_seed)
 {
-  if (rp_gen_seed_chgd == true)
-  {
-    srand (rp_gen_seed);
-  }
-  else
+  u32 seed = rp_gen_seed;
+
+  if (rp_gen_seed_chgd == false)
   {
     const time_t ts = time (NULL); // don't tell me that this is an insecure seed
 
-    srand ((unsigned int) ts);
+    seed = (u32) ts;
   }
+
+  // get_random_num () below draws from rand () under _WIN and from random () everywhere else, and
+  // the two keep their own state. Seeding rand () on a platform that draws from random () left
+  // random () at its default seed, so every run produced the same sequence and the seed did nothing.
+  // glibc hides it by making srand () an alias of srandom (). A libc that keeps the two apart does not.
+
+  #if defined (_WIN)
+
+  srand (seed);
+
+  #else
+
+  srandom (seed);
+
+  #endif
 }
 
 u32 get_random_num (const u32 min, const u32 max)
@@ -327,7 +336,7 @@ void restore_stderr (int saved_fd)
   close (saved_fd);
 }
 
-bool get_free_memory (u64 *free_mem)
+static bool get_free_memory_os (u64 *free_mem)
 {
   #if defined (_WIN)
 
@@ -459,4 +468,25 @@ bool get_free_memory (u64 *free_mem)
   #endif
 
   return false;
+}
+
+// What this process may assume is free, which is not what the machine reports when it is not the
+// only hashcat on it.
+//
+// Several processes started against one machine each see the whole of it, size themselves to it and
+// then allocate, and the sum, which nothing computes, is what runs the machine out of memory. A
+// launcher hands each process its own share through HASHCAT_HOST_MEM_LIMIT, in MiB. Every host side
+// budget is taken from this function, so the one cap here covers all of them.
+
+bool get_free_memory (u64 *free_mem)
+{
+  if (get_free_memory_os (free_mem) == false) return false;
+
+  static i64 cache = -1;
+
+  const u64 limit = hc_env_mib ("HASHCAT_HOST_MEM_LIMIT", &cache);
+
+  if (limit != 0) *free_mem = MIN (*free_mem, limit);
+
+  return true;
 }

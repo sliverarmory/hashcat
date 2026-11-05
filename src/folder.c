@@ -40,9 +40,21 @@ static int get_exec_path (char *exec_path, const size_t exec_path_sz)
 
   #elif defined (_WIN)
 
-  DWORD len = GetModuleFileNameA (NULL, exec_path, (DWORD) exec_path_sz);
+  // The application manifest declares activeCodePage as UTF-8, so the process code page is UTF-8
+  // before the CRT starts and the narrow call writes UTF-8 straight into exec_path. There is no wide
+  // buffer to convert and no error path to free one on.
+  //
+  // GetModuleFileName answers nSize for a path that does not fit and leaves a truncated name behind,
+  // so a full buffer is a failure here. Letting it through would build install_dir, and every folder
+  // taken from it, out of half a path.
 
-  if ((len == 0) || (len >= exec_path_sz)) return -1;
+  const DWORD win_len = GetModuleFileNameA (NULL, exec_path, (DWORD) (exec_path_sz - 1));
+
+  if (win_len == 0) return -1;
+
+  if (win_len >= (DWORD) (exec_path_sz - 1)) return -1;
+
+  size_t len = (size_t) win_len;
 
   // Extended paths reject the forward separators used for resource paths below.
 
@@ -347,6 +359,119 @@ char **scan_directory (const char *path)
   return files;
 }
 
+// The folders the module options need, which folder_config_init () keeps as shared_dir and
+// cache_dir. The module options are collected before the command line is parsed, and
+// folder_config_init () cannot run that early: it creates the per user folders and reads the rest of
+// the command line. So the two decisions needed then are made here the same way, without creating
+// anything. cache_path is what --cache-path names, or NULL.
+
+int folder_early_dirs (MAYBE_UNUSED const char *install_folder, MAYBE_UNUSED const char *shared_folder, const char *cache_path, char **shared_dir, char **cache_dir)
+{
+  *shared_dir = NULL;
+  *cache_dir  = NULL;
+
+  const size_t exec_path_sz = 1024;
+
+  char *exec_path = (char *) hcmalloc (exec_path_sz);
+
+  if (get_exec_path (exec_path, exec_path_sz) == -1)
+  {
+    hcfree (exec_path);
+
+    return -1;
+  }
+
+  char *install_dir = (char *) hcmalloc (HCBUFSIZ_TINY);
+
+  #if defined (_POSIX)
+
+  static const char SLASH[] = "/";
+
+  if (install_folder == NULL) install_folder = SLASH;
+
+  char *resolved_install_folder = realpath (install_folder, NULL);
+  char *resolved_exec_path      = realpath (exec_path, NULL);
+
+  hcfree (exec_path);
+
+  if (resolved_install_folder == NULL) resolved_install_folder = hcstrdup (SLASH);
+
+  if (resolved_exec_path == NULL)
+  {
+    hcfree (resolved_install_folder);
+    hcfree (install_dir);
+
+    return -1;
+  }
+
+  get_install_dir (install_dir, resolved_exec_path);
+
+  const bool installed = (strcmp (install_dir, resolved_install_folder) == 0);
+
+  hcfree (resolved_install_folder);
+  hcfree (resolved_exec_path);
+
+  if (installed == true)
+  {
+    *shared_dir = (shared_folder != NULL) ? hcstrdup (shared_folder) : hcstrdup (install_dir);
+
+    // an installed hashcat caches per user, and without a home there is no cache directory
+
+    if (cache_path != NULL)
+    {
+      *cache_dir = hcstrdup (cache_path);
+    }
+    else
+    {
+      struct passwd pw;
+      struct passwd *pwp = NULL;
+
+      char buf[HCBUFSIZ_TINY];
+
+      memset (buf, 0, sizeof (buf));
+      memset (&pw, 0, sizeof (pw));
+
+      getpwuid_r (getuid (), &pw, buf, HCBUFSIZ_TINY, &pwp);
+
+      if (pwp != NULL)
+      {
+        char user_cache_dir[HCBUFSIZ_TINY];
+
+        get_cache_dir (user_cache_dir, pwp->pw_dir);
+
+        hc_asprintf (cache_dir, "%s/%s", user_cache_dir, CACHE_FOLDER);
+      }
+    }
+
+    hcfree (install_dir);
+
+    return 0;
+  }
+
+  #else
+
+  get_install_dir (install_dir, exec_path);
+
+  hcfree (exec_path);
+
+  #endif
+
+  *shared_dir = hcstrdup (install_dir);
+
+  if (cache_path != NULL)
+  {
+    *cache_dir = hcstrdup (cache_path);
+  }
+  else
+  {
+    hc_asprintf (cache_dir, "%s/%s", install_dir, CACHE_FOLDER);
+  }
+
+  hcfree (install_dir);
+
+  return 0;
+}
+
 int folder_config_init (hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED const char *install_folder, MAYBE_UNUSED const char *shared_folder)
 {
   folder_config_t *folder_config = hashcat_ctx->folder_config;
@@ -628,8 +753,17 @@ int folder_config_init (hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED const char *ins
 
   // A name that could not be built leaves the directory as it was rather than a NULL every path below
   // would be written against.
+  //
+  // cache_dir is its own allocation here whenever it is not still install_dir under another name.
+  // Replacing it with cache_root without freeing that allocation first would leak it, and freeing it
+  // when it is install_dir would free memory the struct still needs later.
 
-  if (cache_root != NULL) cache_dir = cache_root;
+  if (cache_root != NULL)
+  {
+    if (cache_dir != install_dir) hcfree (cache_dir);
+
+    cache_dir = cache_root;
+  }
 
   /**
    * kernel cache, we need to make sure folder exist
@@ -668,6 +802,14 @@ void folder_config_destroy (hashcat_ctx_t *hashcat_ctx)
   // cache_dir is always its own allocation now, where it used to be install_dir under another name.
 
   if (folder_config->cache_dir != folder_config->install_dir) hcfree (folder_config->cache_dir);
+
+  // profile_dir, session_dir and shared_dir are each their own allocation when the running binary
+  // is in the install folder, and install_dir under another name everywhere else, same as cache_dir
+  // used to be.
+
+  if (folder_config->profile_dir != folder_config->install_dir) hcfree (folder_config->profile_dir);
+  if (folder_config->session_dir != folder_config->install_dir) hcfree (folder_config->session_dir);
+  if (folder_config->shared_dir  != folder_config->install_dir) hcfree (folder_config->shared_dir);
 
   hcfree (folder_config->install_dir);
 

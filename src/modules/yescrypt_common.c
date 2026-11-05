@@ -655,7 +655,7 @@ static u64 yescrypt_size_per_accel (const hashes_t *hashes)
   return size_per_accel;
 }
 
-const char *yescrypt_module_extra_tuningdb_block (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, const backend_ctx_t *backend_ctx, MAYBE_UNUSED const hashes_t *hashes, const u32 device_id, const u32 kernel_accel_user)
+char *yescrypt_module_extra_tuningdb_block (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, const backend_ctx_t *backend_ctx, MAYBE_UNUSED const hashes_t *hashes, const u32 device_id, const u32 kernel_accel_user)
 {
   hc_device_param_t *device_param = &backend_ctx->devices_param[device_id];
 
@@ -737,6 +737,20 @@ u64 yescrypt_module_tmp_size (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE
   const u64 tmp_size = 0; // we'll add some later
 
   return tmp_size;
+}
+
+int yescrypt_module_benchmark_cost (MAYBE_UNUSED const hashconfig_t *hashconfig, const salt_t *salt, const void *esalt_buf, char *line_buf, const int line_size)
+{
+  // yescrypt extends scrypt with a time factor t on top of N, r and p. N, r and p sit in the salt.
+  // The esalt opens with flags then t, so t is its second u32. salt_iter folds N together with the
+  // passes, so the plain Iterations readout stands for none of the four on its own.
+
+  const u32 N = salt->scrypt_N;
+  const u32 r = salt->scrypt_r;
+  const u32 p = salt->scrypt_p;
+  const u32 t = (esalt_buf != NULL) ? ((const u32 *) esalt_buf)[1] : 0;
+
+  return snprintf (line_buf, line_size, "N=%u, r=%u, p=%u, t=%u", N, r, p, t);
 }
 
 u64 yescrypt_module_extra_tmp_size (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra, MAYBE_UNUSED const hashes_t *hashes, const u64 esalt_size)

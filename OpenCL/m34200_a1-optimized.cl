@@ -15,8 +15,8 @@
 
 DECLSPEC u64 MurmurHash64A (const u64 seed, PRIVATE_AS const u32 *data, const u32 len)
 {
-#define M 0xc6a4a7935bd1e995
-#define R 47
+  #define M 0xc6a4a7935bd1e995
+  #define R 47
 
   // Initialize hash
   u64 hash = seed ^ (len * M);
@@ -59,8 +59,8 @@ DECLSPEC u64 MurmurHash64A (const u64 seed, PRIVATE_AS const u32 *data, const u3
   hash *= M;
   hash ^= hash >> R;
 
-#undef M
-#undef R
+  #undef M
+  #undef R
 
   return hash;
 }
@@ -113,6 +113,10 @@ KERNEL_FQ KERNEL_FA void m34200_m04 (KERN_ATTR_BASIC ())
 
     const u32 pw_len = pw_l_len + pw_r_len;
 
+    // pw_max bounds the base word alone, so the pair can exceed the 64 bytes the concat fills.
+
+    if (pw_len > 64) continue;
+
     /**
      * concat password candidate
      */
@@ -147,14 +151,7 @@ KERNEL_FQ KERNEL_FA void m34200_m04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32 comb_off = COMBS_PRE_LEN + pw_l_len;
 
@@ -303,6 +300,10 @@ KERNEL_FQ KERNEL_FA void m34200_s04 (KERN_ATTR_BASIC ())
 
     const u32 pw_len = pw_l_len + pw_r_len;
 
+    // pw_max bounds the base word alone, so the pair can exceed the 64 bytes the concat fills.
+
+    if (pw_len > 64) continue;
+
     /**
      * concat password candidate
      */
@@ -337,14 +338,7 @@ KERNEL_FQ KERNEL_FA void m34200_s04 (KERN_ATTR_BASIC ())
       // is a property of the mask, so those shifts are by a scalar and cost what the shift by
       // pw_l_len costs today.
 
-      if (COMBS_PRE_LEN > 0)
-      {
-        switch_buffer_by_offset_le_VV (wordl0, wordl1, wordl2, wordl3, COMBS_PRE_LEN);
-
-        combs_piece8_VV (combs_buf, il_pos, COMBS_PIECE_PRE, wordr0, wordr1, wordr2, wordr3);
-
-        combs_fold_VV (wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
-      }
+      if (COMBS_PRE_LEN > 0) combs_pre8_VV (combs_buf, il_pos, COMBS_PRE_LEN, wordl0, wordl1, wordl2, wordl3, wordr0, wordr1, wordr2, wordr3);
 
       u32 comb_off = COMBS_PRE_LEN + pw_l_len;
 

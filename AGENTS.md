@@ -6,19 +6,22 @@ Contributions written with an AI coding agent are welcome. This file is the part
 
 ## Build and test
 
-    make                       # builds ./hashcat and libhashcat.so
-    ./tools/test_edge.sh -m 0  # unit test for one mode
-    ./tools/test_edge.sh -h    # all options
+    make                        # builds ./hashcat and libhashcat.so
+    ./tools/test.py -S -m 0     # crack the mode's own self-test vector
+    ./tools/test.py --edge -m 0 # edge test for one mode
+    ./tools/test.py -h          # all options
 
-With only `-m`, the suite covers every attack type, kernel type, target type and vector width for that mode. Add `-D 1 -f` on a machine with no GPU, where hashcat runs on the CPU backend and needs `--force`.
+With only `-m`, the edge test covers every attack type, kernel type, target type and vector width for that mode. A run without `--edge` tests only attack mode 0 and only the optimized kernels. Add `-a all` for every attack mode, and run it again with `-P` for the pure kernels. A mode without optimized kernels is skipped unless you pass `-P`. Add `-D 1 -f` on a machine with no GPU, where hashcat runs on the CPU backend and needs `--force`.
 
-Hashcat caches compiled kernels. `test_edge.sh` clears that cache itself. When you run hashcat directly after a change under `OpenCL/`, run `rm -rf cache/kernels/` first, or you will measure the old binary and conclude the change did nothing.
+`-S` is the check to repeat while you iterate. It cracks each mode's own self-test vector, which finishes much faster than the full suite but skips most attack types and kernel paths. Run the full suite and `--edge` once the change is done, before you report it, rather than after every edit.
+
+Hashcat caches compiled kernels. `test.py` does not touch `cache/kernels/`: it builds its kernels in a private cache path for each run (setup_isolation in tools/test.py), so it neither uses that cache nor clears it. When you run hashcat directly after a change under `OpenCL/`, run `rm -rf cache/kernels/` first, or you will measure the old binary and conclude the change did nothing.
 
 ## A build is not a result
 
 A kernel that compiles is not a kernel that works, and a self-test vector that passes is not a mode that cracks. A self-test vector is one input, often a degenerate one. It is entirely normal for it to pass while the mode is broken for everything else.
 
-Before you report a fix, run the reproduction command on both sides of the change, with `rm -rf cache/kernels/` in between if a kernel moved, and read the exit code. Before you report that nothing regressed, run `test_edge.sh` for the modes you touched and for the modes that share the code you edited.
+Before you report a fix, run the reproduction command on both sides of the change, with `rm -rf cache/kernels/` in between if a kernel moved, and read the exit code. Before you report that nothing regressed, run `test.py --edge` for the modes you touched and for the modes that share the code you edited.
 
 ## Never present output you did not run
 
@@ -62,7 +65,7 @@ Models emit en dashes, em dashes and curly quotes without intending to, in prose
 
 ## Write the test module
 
-If the change adds a hash mode, add `tools/test_modules/mXXXXX.pm` in the same pull request, and run it. The kernel and `src/modules/module_XXXXX.c` you just wrote already contain everything the test module needs to know.
+If the change adds a hash mode, add `tools/test_modules/mXXXXX.py` in the same pull request, and run it. The kernel and `src/modules/module_XXXXX.c` you just wrote already contain everything the test module needs to know.
 
 CONTRIBUTING.md leaves this optional, because for a human it is hours of work against a mode that may be worth having either way. It costs you almost nothing, so write it. A test module you wrote but never executed is worth less than none, because it looks like coverage.
 
@@ -71,6 +74,10 @@ CONTRIBUTING.md leaves this optional, because for a human it is hours of work ag
 One problem per pull request, and you can violate that by accident, because you can see the other problems while you are in there. Note them for the human, separately. Do not fix them on the same branch.
 
 The same goes for reformatting, renaming and tidying code you happened to read. If it is not the problem being solved, leave it alone.
+
+## Do not edit docs/changes.txt
+
+Almost every commit in the history touches `docs/changes.txt`, so it looks like part of a complete change. Those are the maintainers' commits. A pull request leaves the file alone and suggests its entry on a `Changelog:` line instead, in the format given in CONTRIBUTING.md.
 
 ## Attribution
 

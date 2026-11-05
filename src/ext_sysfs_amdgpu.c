@@ -76,7 +76,21 @@ char *hm_SYSFS_AMDGPU_get_syspath_hwmon (void *hashcat_ctx, const int backend_de
 
   if (hwmonN == NULL)
   {
-    event_log_error (hashcat_ctx, "First_file_in_directory() failed.");
+    hwmon_ctx_t *hwmon_ctx = ((hashcat_ctx_t *) hashcat_ctx)->hwmon_ctx;
+
+    hm_attrs_t *hm_device = &hwmon_ctx->hm_device[backend_device_idx];
+
+    if ((hm_device->fanspeed_get_supported == true) || (hm_device->temperature_get_supported == true))
+    {
+      backend_ctx_t *backend_ctx = ((hashcat_ctx_t *) hashcat_ctx)->backend_ctx;
+
+      const u32 device_id = backend_ctx->devices_param[backend_device_idx].device_id;
+
+      event_log_warning (hashcat_ctx, "* Device #%u: AMD GPU hwmon interface not available. Hardware monitoring disabled.", device_id + 1);
+    }
+
+    hm_device->fanspeed_get_supported    = false;
+    hm_device->temperature_get_supported = false;
 
     hcfree (syspath);
 
@@ -274,7 +288,13 @@ int hm_SYSFS_AMDGPU_get_pp_dpm_sclk (void *hashcat_ctx, const int backend_device
 
     char *ptr = hc_fgets (buf, sizeof (buf), &fp);
 
-    if (ptr == NULL) continue;
+    // Leave the loop on a NULL rather than going round again. The loop condition only tests for the
+    // end of the file, and it is tested before the read, so the last read of a file that ended
+    // cleanly lands here too and must not be treated as a fault. What it must not do is carry on:
+    // amdgpu answers EBUSY on these files while the device is busy, which more than one process
+    // polling them hits easily, and reading again just repeats the same error forever.
+
+    if (ptr == NULL) break;
 
     size_t len = strlen (ptr);
 
@@ -329,7 +349,7 @@ int hm_SYSFS_AMDGPU_get_pp_dpm_mclk (void *hashcat_ctx, const int backend_device
 
     char *ptr = hc_fgets (buf, sizeof (buf), &fp);
 
-    if (ptr == NULL) continue;
+    if (ptr == NULL) break;
 
     size_t len = strlen (ptr);
 
@@ -384,7 +404,7 @@ int hm_SYSFS_AMDGPU_get_pp_dpm_pcie (void *hashcat_ctx, const int backend_device
 
     char *ptr = hc_fgets (buf, sizeof (buf), &fp);
 
-    if (ptr == NULL) continue;
+    if (ptr == NULL) break;
 
     size_t len = strlen (ptr);
 
@@ -435,7 +455,7 @@ int hm_SYSFS_AMDGPU_get_gpu_busy_percent (void *hashcat_ctx, const int backend_d
 
     char *ptr = hc_fgets (buf, sizeof (buf), &fp);
 
-    if (ptr == NULL) continue;
+    if (ptr == NULL) break;
 
     size_t len = strlen (ptr);
 
@@ -486,7 +506,7 @@ int hm_SYSFS_AMDGPU_get_mem_info_vram_used (void *hashcat_ctx, const int backend
 
     char *ptr = hc_fgets (buf, sizeof (buf), &fp);
 
-    if (ptr == NULL) continue;
+    if (ptr == NULL) break;
 
     size_t len = strlen (ptr);
 

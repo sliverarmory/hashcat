@@ -6,6 +6,7 @@
 #include "common.h"
 #include "types.h"
 #include "event.h"
+#include "convert.h"
 #include "locking.h"
 #include "emu_inc_rp.h"
 #include "emu_inc_rp_optimized.h"
@@ -32,28 +33,67 @@ static void out_flush (out_t *out)
   out->len = 0;
 }
 
+// Write one candidate and the line ending that closes it, and answer how many bytes that took.
+//
+// A candidate can hold any byte, a line ending among them, and written out as it stands that turns
+// one candidate into two lines with nothing to tell the halves apart. A reader cannot put them back
+// together, and piping --stdout into another hashcat feeds it two words. The $HEX[] form the outfile
+// already uses for the same reason keeps one candidate on one line.
+//
+// The widest a candidate can get is "$HEX[" plus two characters a byte plus "]" plus the line
+// ending, which is what STDOUT_CAND_MAX below reserves for it.
+
+static size_t stdout_append (char *dst, const u8 *pw_buf, const int pw_len, const bool always_ascii)
+{
+  size_t len = 0;
+
+  if (need_hexify (pw_buf, (size_t) pw_len, 0, always_ascii) == true)
+  {
+    memcpy (dst, "$HEX[", 5);
+
+    len += 5;
+
+    len += exec_hexify (pw_buf, (size_t) pw_len, (u8 *) dst + len);
+
+    dst[len] = ']';
+
+    len += 1;
+  }
+  else
+  {
+    memcpy (dst, pw_buf, (size_t) pw_len);
+
+    len += (size_t) pw_len;
+  }
+
+  #if defined (_WIN)
+
+  dst[len + 0] = '\r';
+  dst[len + 1] = '\n';
+
+  len += 2;
+
+  #else
+
+  dst[len] = '\n';
+
+  len += 1;
+
+  #endif
+
+  return len;
+}
+
 static void out_push (out_t *out, const u8 *pw_buf, const int pw_len)
 {
   char *ptr = out->buf + out->len;
 
-  memcpy (ptr, pw_buf, pw_len);
+  out->len += (int) stdout_append (ptr, pw_buf, pw_len, out->always_ascii);
 
-  #if defined (_WIN)
+  // the flush has to leave room for a whole candidate, because the next one is written before the
+  // buffer is looked at again
 
-  ptr[pw_len + 0] = '\r';
-  ptr[pw_len + 1] = '\n';
-
-  out->len += pw_len + 2;
-
-  #else
-
-  ptr[pw_len] = '\n';
-
-  out->len += pw_len + 1;
-
-  #endif
-
-  if (out->len >= STDOUT_BUFSIZ - 300)
+  if (out->len >= (int) (STDOUT_BUFSIZ - STDOUT_CAND_MAX))
   {
     out_flush (out);
   }
@@ -90,6 +130,7 @@ typedef struct stdout_rule_job
 
   const kernel_rule_t *rules;
   bool                 optimized;
+  bool                 always_ascii;
   u32                  pw_max;
 
   char                *buf;
@@ -135,20 +176,7 @@ static HC_THREAD_FUNC stdout_rule_worker (void *p)
 
     if (plain_len > (int) job->pw_max) plain_len = (int) job->pw_max;
 
-    memcpy (job->buf + job->len, plain_ptr, (size_t) plain_len);
-
-    job->len += (size_t) plain_len;
-
-    #if defined (_WIN)
-    job->buf[job->len + 0] = '\r';
-    job->buf[job->len + 1] = '\n';
-
-    job->len += 2;
-    #else
-    job->buf[job->len] = '\n';
-
-    job->len += 1;
-    #endif
+    job->len += stdout_append (job->buf + job->len, plain_ptr, plain_len, job->always_ascii);
   }
 
   return 0;
@@ -161,7 +189,6 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
   outfile_ctx_t        *outfile_ctx        = hashcat_ctx->outfile_ctx;
   straight_ctx_t       *straight_ctx       = hashcat_ctx->straight_ctx;
   user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
-  user_options_t       *user_options       = hashcat_ctx->user_options;
 
   // prevent wrong candidates in output when backend_ctx->backend_devices_active > 1
 
@@ -172,6 +199,10 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
   out_t out;
 
   out.write_failed = false;
+
+  const bool always_ascii = (hashconfig->opts_type & OPTS_TYPE_PT_ALWAYS_ASCII) ? true : false;
+
+  out.always_ascii = always_ascii;
 
   if (filename)
   {
@@ -222,7 +253,7 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
 
   int rc = 0;
 
-  if (user_options->attack_mode == ATTACK_MODE_BF)
+  if (user_options_extra->attack_kern == ATTACK_KERN_BF)
   {
     for (u64 gidvid = 0; gidvid < pws_cnt; gidvid++)
     {
@@ -291,43 +322,26 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
 
     while (gidvid_blk < pws_cnt)
     {
-      // copy the pw indexes from device for this block
-
       u64 remain  = pws_cnt - gidvid_blk;
       u64 blk_cnt = MIN (remain, blk_cnt_max);
 
-      // Under --stdout no hash kernel runs, so nothing on the device has touched d_pws_idx or
-      // d_pws_comp since run_copy () uploaded them from these very host buffers. pws_idx_blk and
-      // pws_comp_blk are those host buffers, so reading the device back writes the same bytes where
-      // they already are. Only the first block can skip it: a later one would have to be moved to
-      // the front of the buffer, which is what the copy is for.
-
-      const bool pws_already_on_host = (gidvid_blk == 0);
-
-      if (pws_already_on_host == false)
-      {
-        rc = copy_pws_idx (hashcat_ctx, device_param, gidvid_blk, blk_cnt, pws_idx_blk);
-
-        if (rc == -1) break;
-      }
+      // The first block is always the whole launch, so there is never a second one. blk_cnt_max is
+      // size_pws_idx divided by one entry, and size_pws_idx holds kernel_power_max + 1 of them
+      // because run_copy () reads a sentinel entry one past the last word. pws_cnt is at most
+      // kernel_power_max, so remain is always below blk_cnt_max.
+      //
+      // That is also why nothing is read back from the device here. Under --stdout no hash kernel
+      // runs, and run_copy () uploaded the index and the words from pws_idx_blk and pws_comp_blk,
+      // which are the host buffers read below, so they already hold what this needs. A second block
+      // would have had to be moved to the front of those buffers, and that is what the two reads
+      // this used to make were for.
 
       const u32 off_blk = (blk_cnt > 0) ? pws_idx_blk[0].off : 0;
 
       const pw_idx_t *pw_idx      = device_param->pws_idx;
       const pw_idx_t *pw_idx_last = pw_idx + (blk_cnt - 1);
 
-      // copy the pw buffer data from device for this block
-
-      u32 copy_cnt = (pw_idx_last->off + pw_idx_last->cnt) - pws_idx_blk->off;
-
-      if (pws_already_on_host == false)
-      {
-        rc = copy_pws_comp (hashcat_ctx, device_param, off_blk, copy_cnt, pws_comp_blk);
-
-        if (rc == -1) break;
-      }
-
-      if ((user_options->attack_mode == ATTACK_MODE_STRAIGHT) || (user_options->attack_mode == ATTACK_MODE_GENERIC) || (user_options->attack_mode == ATTACK_MODE_ASSOCIATION))
+      if ((user_options_extra->attack_kern == ATTACK_KERN_STRAIGHT) || (user_options_extra->attack_kern == ATTACK_KERN_PCFG))
       {
         bool done_parallel = false;
 
@@ -343,7 +357,7 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
 
         if (threads > 1)
         {
-          const size_t cand_max = (size_t) hashconfig->pw_max + 2;
+          const size_t cand_max = ((size_t) hashconfig->pw_max * 2) + 8;
 
           u64 pairs_per_round = STDOUT_RULE_ROUND_BYTES / cand_max;
 
@@ -391,6 +405,7 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
                 jobs[t].rules         = straight_ctx->kernel_rules_buf;
                 jobs[t].optimized     = (hashconfig->opti_type & OPTI_TYPE_OPTIMIZED_KERNEL) ? true : false;
                 jobs[t].pw_max        = hashconfig->pw_max;
+                jobs[t].always_ascii  = always_ascii;
                 jobs[t].buf           = pool + ((size_t) t * worker_buf_sz);
                 jobs[t].len           = 0;
 
@@ -471,7 +486,7 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
           pw_idx++;
         }
       }
-      else if (user_options->attack_mode == ATTACK_MODE_HYBRID)
+      else if (user_options_extra->attack_kern == ATTACK_KERN_COMBI)
       {
         char mask_buf[256];
 
@@ -519,7 +534,7 @@ int process_stdout (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param,
 
   if (filename)
   {
-    hc_unlockfile (&out.fp);
+    hc_unlockfile_warn (hashcat_ctx, &out.fp, filename, &outfile_ctx->lock_warned);
 
     hc_fclose (&out.fp);
   }

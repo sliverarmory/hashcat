@@ -24,6 +24,7 @@ static const u32   OPTI_TYPE      = OPTI_TYPE_ZERO_BYTE
                                   | OPTI_TYPE_NOT_ITERATED;
 static const u64   OPTS_TYPE      = OPTS_TYPE_STOCK_MODULE
                                   | OPTS_TYPE_PT_GENERATE_LE
+                                  | OPTS_TYPE_PT_ALWAYS_ASCII
                                   | OPTS_TYPE_ST_HEX
                                   | OPTS_TYPE_AUTODETECT_DISABLE;
 static const u32   SALT_TYPE      = SALT_TYPE_EMBEDDED;
@@ -151,7 +152,10 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   size_t parse_off = 0;
 
-  if (line_buf[token.len[0]] == '2' && line_buf[token.len[0] + 1] == '3' && line_buf[token.len[0] + 2] == '$')
+  // the three bytes that tell the two formats apart are read before they are known to be there
+
+  if ((line_len > (token.len[0] + 2))
+   && (line_buf[token.len[0]] == '2') && (line_buf[token.len[0] + 1] == '3') && (line_buf[token.len[0] + 2] == '$'))
   {
     // hashcat format
     krb5asrep->format = 1;
@@ -164,13 +168,21 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   }
 
   const char *account_info_start = line_buf + strlen (SIGNATURE_KRB5ASREP) + parse_off;
-  const char *account_info_stop  = strchr (account_info_start, ':');
+
+  // hc_strchr_next, not strchr: the field ends where the line ends, not at a NUL the caller is not
+  // required to put there
+
+  const int account_info_left = line_len - (int) (account_info_start - line_buf);
+
+  if (account_info_left < 0) return (PARSER_SALT_LENGTH);
+
+  const char *account_info_stop = (const char *) hc_strchr_next ((const u8 *) account_info_start, account_info_left, ':');
 
   if (account_info_stop == NULL) return (PARSER_SEPARATOR_UNMATCHED);
 
   const int account_info_len = (int) (account_info_stop - account_info_start);
 
-  if (account_info_len > (int) sizeof (krb5asrep->account_info)) return (PARSER_SALT_LENGTH);
+  if (account_info_len >= (int) sizeof (krb5asrep->account_info)) return (PARSER_SALT_LENGTH);
 
   token.token_cnt  = 4;
 
@@ -258,7 +270,12 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   u8 *edata_ptr = (u8 *) krb5asrep->edata2;
 
-  for (int i = 0; i < data_len; i += 2)
+  if (data_len & 1) return (PARSER_TOKEN_LENGTH);
+
+  // i + 1, not i: the loop reads two characters per byte, so an odd data_len read one past the
+  // token, which is the next field of the line or the caller's terminator
+
+  for (int i = 0; (i + 1) < data_len; i += 2)
   {
     const u8 p0 = data_pos[i + 0];
     const u8 p1 = data_pos[i + 1];
@@ -345,6 +362,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_benchmark_mask           = module_benchmark_mask;
   module_ctx->module_benchmark_charset        = MODULE_DEFAULT;
   module_ctx->module_benchmark_salt           = MODULE_DEFAULT;
+  module_ctx->module_benchmark_cost           = MODULE_DEFAULT;
   module_ctx->module_bridge_name              = MODULE_DEFAULT;
   module_ctx->module_bridge_type              = MODULE_DEFAULT;
   module_ctx->module_build_plain_postprocess  = MODULE_DEFAULT;
@@ -370,10 +388,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_status       = MODULE_DEFAULT;
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
+  module_ctx->module_hash_hints               = MODULE_DEFAULT;
   module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
+  module_ctx->module_hash_recipe              = MODULE_DEFAULT;
   module_ctx->module_hashes_count_min         = MODULE_DEFAULT;
   module_ctx->module_hashes_count_max         = MODULE_DEFAULT;
   module_ctx->module_hlfmt_disable            = MODULE_DEFAULT;
@@ -392,8 +412,10 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_kernel_loops_min         = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_max       = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_min       = MODULE_DEFAULT;
+  module_ctx->module_kern_bits                = MODULE_DEFAULT;
   module_ctx->module_kern_type                = module_kern_type;
   module_ctx->module_kern_type_dynamic        = MODULE_DEFAULT;
+  module_ctx->module_length_sort              = MODULE_DEFAULT;
   module_ctx->module_opti_type                = module_opti_type;
   module_ctx->module_opts_type                = module_opts_type;
   module_ctx->module_outfile_check_disable    = MODULE_DEFAULT;
@@ -404,6 +426,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_pwdump_column            = MODULE_DEFAULT;
   module_ctx->module_pw_max                   = module_pw_max;
   module_ctx->module_pw_min                   = module_pw_min;
+  module_ctx->module_register_options         = MODULE_DEFAULT;
   module_ctx->module_salt_max                 = MODULE_DEFAULT;
   module_ctx->module_salt_min                 = MODULE_DEFAULT;
   module_ctx->module_salt_type                = module_salt_type;

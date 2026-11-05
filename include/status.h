@@ -24,6 +24,7 @@ int         status_get_group_id_dev                   (const hashcat_ctx_t *hash
 int         status_get_group_size_dev                 (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
 bool        status_get_skipped_dev                    (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
 bool        status_get_skipped_warning_dev            (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
+bool        status_get_idle_dev                       (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
 char       *status_get_session                        (const hashcat_ctx_t *hashcat_ctx);
 const char *status_get_status_string                  (const hashcat_ctx_t *hashcat_ctx);
 int         status_get_status_number                  (const hashcat_ctx_t *hashcat_ctx);
@@ -42,15 +43,15 @@ int         status_get_guess_mask_length              (const hashcat_ctx_t *hash
 char       *status_get_guess_candidates_dev           (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
 char       *status_get_hash_name                      (const hashcat_ctx_t *hashcat_ctx);
 char       *status_get_hash_target                    (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_digests_done                   (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_digests_done_pot               (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_digests_done_zero              (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_digests_done_new               (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_digests_cnt                    (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_digests_done                   (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_digests_done_pot               (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_digests_done_zero              (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_digests_done_new               (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_digests_cnt                    (const hashcat_ctx_t *hashcat_ctx);
 double      status_get_digests_percent                (const hashcat_ctx_t *hashcat_ctx);
 double      status_get_digests_percent_new            (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_salts_done                     (const hashcat_ctx_t *hashcat_ctx);
-int         status_get_salts_cnt                      (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_salts_done                     (const hashcat_ctx_t *hashcat_ctx);
+u32         status_get_salts_cnt                      (const hashcat_ctx_t *hashcat_ctx);
 u64         status_get_amplifier_cnt                  (const hashcat_ctx_t *hashcat_ctx);
 u32         status_get_iteration_cnt                  (const hashcat_ctx_t *hashcat_ctx, const int salt_pos);
 double      status_get_salts_percent                  (const hashcat_ctx_t *hashcat_ctx);
@@ -81,6 +82,7 @@ u64         status_get_progress_ignore                (const hashcat_ctx_t *hash
 u64         status_get_progress_skip                  (const hashcat_ctx_t *hashcat_ctx);
 u64         status_get_progress_cur_relative_skip     (const hashcat_ctx_t *hashcat_ctx);
 u64         status_get_progress_end_relative_skip     (const hashcat_ctx_t *hashcat_ctx);
+bool        status_get_stdin_count_exceeded           (const hashcat_ctx_t *hashcat_ctx);
 double      status_get_hashes_msec_all                (const hashcat_ctx_t *hashcat_ctx);
 double      status_get_hashes_msec_dev                (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);
 double      status_get_hashes_msec_dev_benchmark      (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx);

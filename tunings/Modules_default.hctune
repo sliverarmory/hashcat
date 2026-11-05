@@ -41,11 +41,10 @@ ALIAS_nv_real_simd                              3       5500    4       A       
 ALIAS_nv_real_simd                              3       5600    2       A       A
 ALIAS_nv_real_simd                              3       8700    4       A       A
 ALIAS_nv_real_simd                              3       9900    2       A       A
-ALIAS_nv_real_simd                              3       11000   4       A       A
 ALIAS_nv_real_simd                              3       11100   2       A       A
-ALIAS_nv_real_simd                              3       11900   2       A       A
 ALIAS_nv_real_simd                              3       13300   4       A       A
 ALIAS_nv_real_simd                              3       18700   8       A       A
+ALIAS_nv_real_simd                              3       40031   2       A       A
 ALIAS_nv_real_simd                              3       99999   4       A       A
 
 ALIAS_nv_sm50_or_higher                         3       0       8       A       A
@@ -83,7 +82,6 @@ ALIAS_nv_sm50_or_higher                         3       6100    2       A       
 ALIAS_nv_sm50_or_higher                         3       7300    2       A       A
 ALIAS_nv_sm50_or_higher                         3       9720    2       A       A
 ALIAS_nv_sm50_or_higher                         3       9900    4       A       A
-ALIAS_nv_sm50_or_higher                         3       11000   2       A       A
 ALIAS_nv_sm50_or_higher                         3       13711   2       A       A
 ALIAS_nv_sm50_or_higher                         3       13712   2       A       A
 ALIAS_nv_sm50_or_higher                         3       13713   2       A       A
@@ -190,6 +188,14 @@ ALIAS_INTEL                                     3       23700   2       A       
 ALIAS_INTEL                                     3       24700   2       A       A
 ALIAS_INTEL                                     3       99999   4       A       A
 
+ALIAS_Apple_M                                   3       0       2       A       A
+ALIAS_Apple_M                                   3       11      2       A       A
+ALIAS_Apple_M                                   3       22      2       A       A
+ALIAS_Apple_M                                   3       900     2       A       A
+ALIAS_Apple_M                                   3       1000    2       A       A
+ALIAS_Apple_M                                   3       1100    2       A       A
+ALIAS_Apple_M                                   3       18700   2       A       A
+
 ##
 ## CryptoAPI
 ##
@@ -215,4 +221,7 @@ ALIAS_AMD                                       3       17200   N       32      
 ALIAS_NV                                        3       17200   N       1024    A
 ALIAS_INTEL                                     0       18100   N       1024    A
 ALIAS_INTEL                                     1       18100   N       128     A
+ALIAS_NV                                        *       23700   N       6       A
 ALIAS_INTEL                                     3       29421   N       1024    A
+ALIAS_AMD                                       *       34600   N       4       A
+ALIAS_NV                                        *       34600   N       1       A

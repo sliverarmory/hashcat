@@ -55,6 +55,8 @@ static int hm_get_adapter_index_nvml (hashcat_ctx_t *hashcat_ctx, HM_ADAPTER_NVM
   return (deviceCount);
 }
 
+static bool hm_bridge_has_sensors (const bridge_ctx_t *bridge_ctx);
+
 // Do two backend devices sit on the same piece of physical hardware?
 //
 // They often do. --backend-devices-virtmulti clones one device into several, and a bridge clones the
@@ -68,23 +70,25 @@ static bool hm_same_hardware (hashcat_ctx_t *hashcat_ctx, const hc_device_param_
 {
   bridge_ctx_t *bridge_ctx = hashcat_ctx->bridge_ctx;
 
-  // With a bridge the device that does the work is the bridge unit, not the feeder, so the unit is
-  // what identifies the hardware. The startup listing already tells units apart by comparing the
-  // strings from get_unit_info, so use the same rule here and the two displays cannot disagree.
+  // A bridge that reports sensors reports them per unit, so the unit identifies the hardware, and two
+  // units are two pieces of it. Equal get_unit_info strings prove nothing here: they describe the
+  // model, so several identical units return the same one. Treating that as one unit kept every unit
+  // after the first off the watchdog banner and out of the throttle check.
+  //
+  // A device that is not linked to a unit, and every device of a bridge without sensors, is measured
+  // through the backend device feeding it, which the handle comparison below identifies.
 
-  if (bridge_ctx->enabled == true)
+  if ((bridge_ctx->enabled == true) && (hm_bridge_has_sensors (bridge_ctx) == true))
   {
-    if (bridge_ctx->get_unit_info == NULL) return true;
+    const int unit_a = device_param_a->bridge_link_device;
+    const int unit_b = device_param_b->bridge_link_device;
 
-    const char *info_a = bridge_ctx->get_unit_info (hashcat_ctx, bridge_ctx->platform_context, device_param_a->bridge_link_device);
-    const char *info_b = bridge_ctx->get_unit_info (hashcat_ctx, bridge_ctx->platform_context, device_param_b->bridge_link_device);
+    if ((unit_a >= 0) || (unit_b >= 0))
+    {
+      const bool same = (unit_a == unit_b);
 
-    if (info_a == NULL) return true;
-    if (info_b == NULL) return true;
-
-    const bool same = (strcmp (info_a, info_b) == 0);
-
-    return same;
+      return same;
+    }
   }
 
   // One piece of hardware can also be reached through two different runtimes, for instance a GPU
@@ -138,6 +142,8 @@ static bool hm_bridge_has_sensors (const bridge_ctx_t *bridge_ctx)
     (const void *) bridge_ctx->get_unit_temperature,
     (const void *) bridge_ctx->get_unit_temperature_str,
     (const void *) bridge_ctx->get_unit_temperature_abort,
+    (const void *) bridge_ctx->get_unit_temperature_unwatched,
+    (const void *) bridge_ctx->get_unit_buslanes_str,
     (const void *) bridge_ctx->get_unit_fanspeed,
     (const void *) bridge_ctx->get_unit_utilization,
     (const void *) bridge_ctx->get_unit_corespeed,
@@ -531,6 +537,11 @@ void hm_temperature_abort_banner (hashcat_ctx_t *hashcat_ctx)
   int watched_cnt = 0;
   int compute_cnt = 0;
 
+  // Whether a bridge owns any device at all. src/monitor.c measures the candidate generator on that
+  // alone, so the banner has to ask the same question rather than inferring it from the unit list.
+
+  bool bridge_any = false;
+
   if (backend_ctx->enabled == true)
   {
     for (int backend_devices_idx = 0; backend_devices_idx < backend_ctx->backend_devices_cnt; backend_devices_idx++)
@@ -552,6 +563,8 @@ void hm_temperature_abort_banner (hashcat_ctx_t *hashcat_ctx)
         continue;
       }
 
+      bridge_any = true;
+
       // Devices that share one piece of hardware share its limit too, so only the device that carries
       // the hwmon line for that hardware names it. Otherwise a bridge with many units on one device
       // would report the same hardware once per unit.
@@ -560,7 +573,17 @@ void hm_temperature_abort_banner (hashcat_ctx_t *hashcat_ctx)
 
       const u32 temp_abort_unit = hm_get_bridge_temperature_abort (hashcat_ctx, backend_devices_idx);
 
-      if (temp_abort_unit == 0) continue;
+      // A unit that names no limit of its own is still watched, at the user's setting, which is what
+      // src/monitor.c does with it. It has nothing of its own to name, so it is counted as watched
+      // and left out of the list below. Counting it is what stops the banner reporting the abort as
+      // disabled while the watchdog is armed on every unit.
+
+      if (temp_abort_unit == 0)
+      {
+        if (hm_get_temperature_with_devices_idx (hashcat_ctx, backend_devices_idx) >= 0) watched_cnt++;
+
+        continue;
+      }
 
       if (cnt == DEVICES_MAX) break;
 
@@ -599,7 +622,7 @@ void hm_temperature_abort_banner (hashcat_ctx_t *hashcat_ctx)
 
   int feeder_idx = -1;
 
-  if ((cnt > 0) && (backend_ctx->enabled == true))
+  if ((bridge_any == true) && (backend_ctx->enabled == true))
   {
     for (int backend_devices_idx = 0; backend_devices_idx < backend_ctx->backend_devices_cnt; backend_devices_idx++)
     {
@@ -607,6 +630,8 @@ void hm_temperature_abort_banner (hashcat_ctx_t *hashcat_ctx)
 
       if (device_param->skipped == true) continue;
       if (device_param->skipped_warning == true) continue;
+
+      if (hm_bridge_owns_device (hashcat_ctx, backend_devices_idx) == false) continue;
 
       const int temp = hm_get_device_temperature (hashcat_ctx, backend_devices_idx);
 
@@ -1794,7 +1819,13 @@ int64_t hm_get_power_with_devices_idx (hashcat_ctx_t *hashcat_ctx, const int bac
     // an unsigned reading cannot use -1, so a bridge reports no reading as 0
     const u64 val = hashcat_ctx->bridge_ctx->get_unit_power (hashcat_ctx, hashcat_ctx->bridge_ctx->platform_context, bridge_unit_power);
 
-    if (val) return (int64_t) val;
+    // Falling through to the vendor path on a 0 would report the feeder device's power as the
+    // unit's own. A bridge that owns this device owns the answer, the way it does for every other
+    // sensor here, so a 0 is reported as no reading rather than handed on.
+
+    if (val == 0) return -1;
+
+    return (int64_t) val;
   }
 
   hwmon_ctx_t   *hwmon_ctx   = hashcat_ctx->hwmon_ctx;
@@ -1816,7 +1847,7 @@ int64_t hm_get_power_with_devices_idx (hashcat_ctx_t *hashcat_ctx, const int bac
       {
         hwmon_ctx->hm_device[backend_device_idx].power_get_supported = false;
 
-        return 0;
+        return -1;
       }
 
       return power;
@@ -2368,20 +2399,6 @@ int hwmon_ctx_init (hashcat_ctx_t *hashcat_ctx)
 
   hwmon_ctx_init_sysfs_cpu (hashcat_ctx, hm_adapters_sysfs_cpu, backend_devices_cnt);
 
-  #if defined (__APPLE__)
-  if (backend_ctx->need_iokit == true)
-  {
-    hwmon_ctx->hm_iokit = (IOKIT_PTR *) hcmalloc (sizeof (IOKIT_PTR));
-
-    if (iokit_init (hashcat_ctx) == false)
-    {
-      hcfree (hwmon_ctx->hm_iokit);
-
-      hwmon_ctx->hm_iokit = NULL;
-    }
-  }
-  #endif
-
   if (hwmon_ctx->hm_adl == NULL && hwmon_ctx->hm_nvml == NULL && hwmon_ctx->hm_sysfs_amdgpu == NULL && hwmon_ctx->hm_sysfs_intelgpu == NULL && hwmon_ctx->hm_sysfs_cpu == NULL && hwmon_ctx->hm_iokit == NULL)
   {
     hcfree (hm_adapters_adl);
@@ -2593,7 +2610,7 @@ int hwmon_ctx_init (hashcat_ctx_t *hashcat_ctx)
             hwmon_ctx->hm_device[backend_devices_idx].threshold_slowdown_get_supported  |= hm_adapters_nvml[device_id].threshold_slowdown_get_supported;
             hwmon_ctx->hm_device[backend_devices_idx].utilization_get_supported         |= hm_adapters_nvml[device_id].utilization_get_supported;
             hwmon_ctx->hm_device[backend_devices_idx].memoryused_get_supported          |= hm_adapters_nvml[device_id].memoryused_get_supported;
-        hwmon_ctx->hm_device[backend_devices_idx].throttle_get_supported            |= hm_adapters_nvml[device_id].throttle_get_supported;
+            hwmon_ctx->hm_device[backend_devices_idx].throttle_get_supported            |= hm_adapters_nvml[device_id].throttle_get_supported;
             hwmon_ctx->hm_device[backend_devices_idx].power_get_supported               |= hm_adapters_nvml[device_id].power_get_supported;
           }
 

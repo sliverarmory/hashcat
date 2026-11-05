@@ -14,7 +14,7 @@ Whatever the size of the patch, describe what prompted the change. A one line di
 
 ## Requirements
 
-1. Licensed under the MIT license, or dedicated to the public domain. BSD and GPL code is incompatible.
+1. Licensed under the MIT license, or dedicated to the public domain. This applies to code written for hashcat. Third-party code keeps its own license, which must allow redistribution with hashcat and is recorded in `docs/license_libs/`. GPL code is never linked into hashcat.
 2. Adheres to the gnu99 standard.
 3. Compiles cleanly with no warnings under `-W -Wall -std=gnu99`.
 
@@ -25,6 +25,7 @@ Match the code around you. The rules below are what that code already does, and 
 ### Layout
 
 * 2 spaces for indentation. A tab only where the format demands one, such as a Makefile.
+* No trailing whitespace. A line ends at its last visible character.
 * [Allman braces](https://en.wikipedia.org/wiki/Indent_style#Allman_style). The opening brace goes on its own line, for functions and for `if`, `else`, `for`, `while` and `switch`.
 * Omit the braces when the body is a single statement that fits on one line: `if (rc == -1) return -1;`
 * Two or more statements, or any nested block, always gets braces.
@@ -83,6 +84,9 @@ u8 lo = (code >> 0) & 0xF;
 
 * `//` for a comment. `/** ... */` only for the file header.
 * A comment goes on its own line above the code it describes, not trailing it.
+* Do not cite another file by line number in a comment. Line numbers go stale the moment either
+  file changes, so `see test.py:5200` is wrong within a commit or two. Name the file, and the
+  function or variable if it helps, instead: `see test.py` or `mirrors test.py setup_isolation`.
 * Project includes first, then system includes, separated by a blank line.
 * Every source file opens with:
 
@@ -125,7 +129,7 @@ Keep the description short. The reader wants to reproduce the problem before rea
 1. One or two sentences of summary.
 2. The reproduction command, in full, with the result before and after the change.
 3. The explanation, once the reader can already see the failure.
-4. The `tools/test_edge.sh` output for every mode you touched.
+4. The `tools/test.py --edge` output for every mode you touched.
 
 A claim that something is broken carries the command that shows it. Not a description of the command, the command itself:
 
@@ -145,17 +149,27 @@ Attack mode 3, with the password as a literal mask, is usually the shortest rout
 
 For step 4, run the suite yourself and paste what it printed:
 
-    ./tools/test_edge.sh -m 0
+    ./tools/test.py --edge -m 0
 
-With only `-m`, the suite covers every attack type, kernel type, target type and vector width for that mode, and it clears the kernel cache before it starts. Add `-D 1 -f` on a machine with no GPU, where hashcat runs on the CPU backend and needs `--force`. `./tools/test_edge.sh -h` lists the rest.
+With only `-m`, the suite covers every attack type, kernel type, target type and vector width for that mode, and it builds its kernels in a private cache path for the run rather than touching `cache/kernels/`. Add `-D 1 -f` on a machine with no GPU, where hashcat runs on the CPU backend and needs `--force`. `./tools/test.py -h` lists the rest.
 
 Paste the tail of the run, down to and including the line that reports how many errors were detected. That line is the one a reviewer looks for.
 
 If a mode you touched cannot be tested on your hardware, say so. Leaving the output out without saying why is what a reviewer will ask about first.
 
+## Leave docs/changes.txt to us
+
+Do not edit `docs/changes.txt`. Most pull requests would add their entry at the end of the same section, so two of them that are open at the same time conflict as soon as one is merged. The other one then needs a rebase for nothing but that line. We write the changelog entry ourselves when we merge.
+
+You can suggest one. Put it on a line of its own that starts with `Changelog:`, either in the pull request description or as the last line of a commit message:
+
+    Changelog: Fixed mode 17010 missing the second of two keys that share an S2K salt
+
+One line per entry. Write it the way the entries in `docs/changes.txt` read: one sentence about what a user notices, plain ASCII, and for a fix a sentence that starts with "Fixed". We read these lines when we merge, but we may reword an entry, combine it with others, file it under a different section, or leave it out.
+
 ## A new hash mode should come with a test module
 
-A mode is only covered by the test suites once a test module exists at `tools/test_modules/mXXXXX.pm`. That is what lets them generate fresh hashes and check that hashcat cracks them, instead of the mode resting on one self-test vector forever. See [tools/test_modules/README.md](tools/test_modules/README.md) for the functions it has to provide, and the [plugin development guide](docs/hashcat-plugin-development-guide.md) for how it fits into the rest of a plugin.
+A mode is only covered by the test suites once a test module exists at `tools/test_modules/mXXXXX.py`. That is what lets them generate fresh hashes and check that hashcat cracks them, instead of the mode resting on one self-test vector forever. See [tools/test_modules/README.md](tools/test_modules/README.md) for the functions it has to provide, and the [plugin development guide](docs/hashcat-plugin-development-guide.md) for how it fits into the rest of a plugin.
 
 Writing it is not a hard requirement, and a mode with a good proof of concept behind it is still worth having without one. Writing it first tends to pay for itself, because it doubles as the proof of concept you need while developing the kernel.
 

@@ -58,8 +58,8 @@ typedef struct krb5db_18_tmp
 {
   u32 ipad[5];
   u32 opad[5];
-  u32 dgst[16];
-  u32 out[16];
+  u32 dgst[10];
+  u32 out[10];
 
 } krb5db_18_tmp_t;
 
@@ -107,11 +107,13 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
    */
 
   // assume no signature found
-  // the strchr() below starts at offset 12, so admitting a 11-byte line lets it
-  // start one past the terminator
   if (line_len < 12) return (PARSER_SALT_LENGTH);
 
-  const char *spn_info_start  = strchr (line_buf + 11 + 1, '*');
+  // hc_strchr_next, not strchr: the field ends where the line ends. strchr () ended it at the
+  // first NUL instead, which is the caller's terminator where there is one and whatever follows
+  // the hash on the line where the caller passed a slice of it.
+
+  const char *spn_info_start = (const char *) hc_strchr_next ((const u8 *) line_buf + 11 + 1, line_len - (11 + 1), '*');
 
   int is_spn_provided = 0;
 
@@ -139,7 +141,11 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   // assume $krb5db$18$user$realm$*spn*$hash
   else
   {
-    const char *spn_info_stop = strchr (spn_info_start + 1, '*');
+    // bounded for the same reason as the search above: the field ends where the line ends
+
+    const int spn_info_left = line_len - (int) (spn_info_start + 1 - line_buf);
+
+    const char *spn_info_stop = (const char *) hc_strchr_next ((const u8 *) spn_info_start + 1, spn_info_left, '*');
 
     if (spn_info_stop == NULL) return (PARSER_SEPARATOR_UNMATCHED);
 
@@ -270,6 +276,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_benchmark_mask           = MODULE_DEFAULT;
   module_ctx->module_benchmark_charset        = MODULE_DEFAULT;
   module_ctx->module_benchmark_salt           = MODULE_DEFAULT;
+  module_ctx->module_benchmark_cost           = MODULE_DEFAULT;
   module_ctx->module_bridge_name              = MODULE_DEFAULT;
   module_ctx->module_bridge_type              = MODULE_DEFAULT;
   module_ctx->module_build_plain_postprocess  = MODULE_DEFAULT;
@@ -295,10 +302,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_status       = MODULE_DEFAULT;
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
+  module_ctx->module_hash_hints               = MODULE_DEFAULT;
   module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
+  module_ctx->module_hash_recipe              = MODULE_DEFAULT;
   module_ctx->module_hashes_count_min         = MODULE_DEFAULT;
   module_ctx->module_hashes_count_max         = MODULE_DEFAULT;
   module_ctx->module_hlfmt_disable            = MODULE_DEFAULT;
@@ -317,8 +326,10 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_kernel_loops_min         = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_max       = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_min       = MODULE_DEFAULT;
+  module_ctx->module_kern_bits                = MODULE_DEFAULT;
   module_ctx->module_kern_type                = module_kern_type;
   module_ctx->module_kern_type_dynamic        = MODULE_DEFAULT;
+  module_ctx->module_length_sort              = MODULE_DEFAULT;
   module_ctx->module_opti_type                = module_opti_type;
   module_ctx->module_opts_type                = module_opts_type;
   module_ctx->module_outfile_check_disable    = MODULE_DEFAULT;
@@ -329,6 +340,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_pwdump_column            = MODULE_DEFAULT;
   module_ctx->module_pw_max                   = MODULE_DEFAULT;
   module_ctx->module_pw_min                   = MODULE_DEFAULT;
+  module_ctx->module_register_options         = MODULE_DEFAULT;
   module_ctx->module_salt_max                 = MODULE_DEFAULT;
   module_ctx->module_salt_min                 = MODULE_DEFAULT;
   module_ctx->module_salt_type                = module_salt_type;

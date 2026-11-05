@@ -50,7 +50,7 @@ static const char *const PA_029 = "Invalid LUKS key AF stripes count";
 static const char *const PA_030 = "Invalid combination of LUKS hash type and cipher type";
 static const char *const PA_031 = "Invalid hccapx signature";
 static const char *const PA_032 = "Invalid hccapx version";
-static const char *const PA_033 = "Invalid hccapx message pair";
+static const char *const PA_033 = "Invalid EAPOL message pair";
 static const char *const PA_034 = "Token encoding exception";
 static const char *const PA_035 = "Token length exception";
 static const char *const PA_036 = "Insufficient entropy exception";
@@ -65,6 +65,7 @@ static const char *const PA_044 = "PT length exception";
 static const char *const PA_045 = "PT offset exception";
 static const char *const PA_046 = "Invalid or unsupported CryptoAPI hash type";
 static const char *const PA_047 = "Invalid CryptoAPI key size";
+static const char *const PA_048 = "Required compression library libzstd was not found";
 static const char *const PA_255 = "Unknown error";
 
 // input_tokenizer() records the offending part of the input line in here when it rejects that line.
@@ -270,6 +271,7 @@ const char *strparser (const u32 parser_status)
     case PARSER_PT_OFFSET:            return PA_045;
     case PARSER_CRYPTOAPI_KERNELTYPE: return PA_046;
     case PARSER_CRYPTOAPI_KEYSIZE:    return PA_047;
+    case PARSER_ZSTD_UNAVAILABLE:     return PA_048;
   }
 
   return PA_255;
@@ -283,11 +285,15 @@ static int rounds_count_length (const char *input_buf, const int input_len)
 
     if (memcmp (input_buf, rounds, 7) == 0)
     {
-      const char *next_pos = strchr (input_buf + 8, '$');
+      // hc_strchr_next rather than strchr: the caller says how long the input is, and that is not
+      // always where the buffer ends. hashes.c hands a parser a slice of the line it read, so a
+      // '$' further along the line is not part of this hash and must not end the rounds field.
+
+      const u8 *next_pos = hc_strchr_next ((const u8 *) input_buf + 8, input_len - 8, '$');
 
       if (next_pos == NULL) return -1;
 
-      const int rounds_len = next_pos - input_buf;
+      const int rounds_len = (const char *) next_pos - input_buf;
 
       return rounds_len;
     }
@@ -515,6 +521,18 @@ int input_tokenizer (const u8 *input_buf, const int input_len, hc_token_t *token
 
     if (token->attr[token_idx] & TOKEN_ATTR_VERIFY_HEX)
     {
+      // Two characters make one byte, so a token that decodes to bytes has an even length. An odd
+      // one is a line that does not mean what it says, and every caller would drop the trailing
+      // character and report success. A field of hex characters that is not decoded to bytes takes
+      // TOKEN_ATTR_VERIFY_BASE16 instead.
+
+      if (token->len[token_idx] & 1) return (PARSER_TOKEN_LENGTH);
+
+      if (is_valid_hex_string (token->buf[token_idx], token->len[token_idx]) == false) return (PARSER_TOKEN_ENCODING);
+    }
+
+    if (token->attr[token_idx] & TOKEN_ATTR_VERIFY_BASE16)
+    {
       if (is_valid_hex_string (token->buf[token_idx], token->len[token_idx]) == false) return (PARSER_TOKEN_ENCODING);
     }
 
@@ -539,6 +557,11 @@ int input_tokenizer (const u8 *input_buf, const int input_len, hc_token_t *token
     if (token->attr[token_idx] & TOKEN_ATTR_VERIFY_BECH32)
     {
       if (is_valid_bech32_string (token->buf[token_idx], token->len[token_idx]) == false) return (PARSER_TOKEN_ENCODING);
+    }
+
+    if (token->attr[token_idx] & TOKEN_ATTR_VERIFY_BASE32A)
+    {
+      if (is_valid_base32a_string (token->buf[token_idx], token->len[token_idx]) == false) return (PARSER_TOKEN_ENCODING);
     }
   }
 

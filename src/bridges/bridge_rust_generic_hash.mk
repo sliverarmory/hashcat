@@ -9,6 +9,14 @@ PLUGINS_LINUX   := $(addprefix $(RUST_SUBS_DIR)/,$(addsuffix .so,$(RUST_CRATES))
 PLUGINS_WIN     := $(addprefix $(RUST_SUBS_DIR)/,$(addsuffix .dll,$(RUST_CRATES)))
 PLUGINS_NATIVE  := $(addprefix $(RUST_SUBS_DIR)/,$(addsuffix .$(PLUGIN_SUFFIX_NATIVE),$(RUST_CRATES)))
 
+# Each crate depends on its own sources and on those of hashcat-sys, which every crate links, and on
+# obj/arrangement for the same reason the C plugins do. These rules carry no recipe and only add
+# prerequisites to the pattern rules below, which name Cargo.toml alone.
+
+RUST_SYS_SRC    := $(call RUST_CRATE_SRC,Rust/hashcat-sys)
+
+$(foreach C,$(RUST_CRATES),$(eval $(RUST_SUBS_DIR)/$(C).so $(RUST_SUBS_DIR)/$(C).dll: $(call RUST_CRATE_SRC,$(RUST_SCAN_DIR)/$(C)) $(RUST_SYS_SRC) obj/arrangement))
+
 BRIDGE_SRC_bridge_rust_generic_hash         := src/bridges/bridge_rust_generic_hash.c src/cpu_features.c
 
 # the crates are built beside the bridge and are not inputs to its compiler, so they are named as
@@ -35,15 +43,19 @@ RUSTFLAGS_DLL   += -C lto -C embed-bitcode=y
 endif
 
 # target-cpu=native describes the machine running the build, so it goes to whichever of the two file
-# names belongs to that machine and not to the one built for a release
+# names belongs to that machine and not to the one built for a release. MCPU names a different
+# machine, and then the crates have to be told the same thing the C side was told, or they are the
+# one part of the artifact still built for the machine that compiled it.
 
 ifeq ($(MAINTAINER_MODE),0)
+RUST_TARGET_CPU := $(if $(MCPU),$(MCPU),native)
+
 ifeq ($(PLUGIN_PLATFORM_so),NATIVE)
-RUSTFLAGS_SO    += -C target-cpu=native
+RUSTFLAGS_SO    += -C target-cpu=$(RUST_TARGET_CPU)
 endif
 
 ifeq ($(PLUGIN_PLATFORM_dll),NATIVE)
-RUSTFLAGS_DLL   += -C target-cpu=native
+RUSTFLAGS_DLL   += -C target-cpu=$(RUST_TARGET_CPU)
 endif
 endif
 
@@ -54,12 +66,12 @@ endif
 # its own parallelism, and the alternative of marking the recipe as recursive would also make it run
 # during a dry run.
 $(RUST_SUBS_DIR)/%.so: $(RUST_SCAN_DIR)/%/Cargo.toml
-	MAKEFLAGS= RUSTFLAGS="$(RUSTFLAGS_SO)" $(RUST_CARGO) build --quiet $(RUST_MODE_FLAG) --target-dir Rust/bridges/$*/target --manifest-path $^
+	MAKEFLAGS= RUSTFLAGS="$(RUSTFLAGS_SO)" $(RUST_CARGO) build --quiet $(RUST_MODE_FLAG) --target-dir Rust/bridges/$*/target --manifest-path $<
 	cp Rust/bridges/$*/target/$(RUST_BUILD_MODE)/lib$*.$(RUST_LIB_EXT) $@
 ifeq ($(RUSTUP_PRESENT),true)
 $(RUST_SUBS_DIR)/%.dll: $(RUST_SCAN_DIR)/%/Cargo.toml
 	$(RUST_RUSTUP) --quiet target add x86_64-pc-windows-gnu
-	MAKEFLAGS= RUSTFLAGS="$(RUSTFLAGS_DLL)" $(RUST_CARGO) build --quiet $(RUST_MODE_FLAG) --target-dir Rust/bridges/$*/target --manifest-path $^ --target x86_64-pc-windows-gnu
+	MAKEFLAGS= RUSTFLAGS="$(RUSTFLAGS_DLL)" $(RUST_CARGO) build --quiet $(RUST_MODE_FLAG) --target-dir Rust/bridges/$*/target --manifest-path $< --target x86_64-pc-windows-gnu
 	cp Rust/bridges/$*/target/x86_64-pc-windows-gnu/$(RUST_BUILD_MODE)/$*.dll $@
 else
 $(RUST_SUBS_DIR)/%.dll: $(RUST_SCAN_DIR)/%/Cargo.toml

@@ -17,6 +17,7 @@
 #include "feed_ctx.h"
 #include "ext_lzma.h"
 #include "mpsp.h"
+#include "status_rc.h"
 
 static const char *const DEF_MASK = "?1?2?2?2?2?2?2?3?3?3?3?d?d?d?d";
 
@@ -246,6 +247,7 @@ static int mp_add_cs_buf (hashcat_ctx_t *hashcat_ctx, const u32 *in_buf, size_t 
     u32 u = in_buf[i] & 0xff;
 
     if (hashconfig->opts_type & OPTS_TYPE_PT_UPPER) u = (u32) toupper (u);
+    if (hashconfig->opts_type & OPTS_TYPE_PT_LOWER) u = (u32) tolower (u);
 
     if (css_uniq[u] == 1) continue;
 
@@ -393,7 +395,10 @@ static int mp_set_w_marker (hashcat_ctx_t *hashcat_ctx, const char *mask_buf, co
   // that are rewritten into attack-mode 12 carry a ?w this put there. A user who writes their own ?w
   // into an aliased mode's mask ends up with two of them and the check below says so.
 
-  if (user_options->attack_mode != ATTACK_MODE_HYBRID)
+  // The hybrid feed is attack-mode 12 rewritten once more, into -a 8, so its masks still carry the
+  // markers and still mean what they meant. Only the generator moved.
+
+  if ((user_options->attack_mode != ATTACK_MODE_HYBRID) && (mask_feed_kind (user_options) != MASK_FEED_HYBRID))
   {
     event_log_error (hashcat_ctx, "?w is supported in attack-mode 12 only. Failed mask: %s", mask_buf);
 
@@ -421,7 +426,7 @@ static int mp_set_q_marker (hashcat_ctx_t *hashcat_ctx, const char *mask_buf, co
   mask_ctx_t           *mask_ctx     = hashcat_ctx->mask_ctx;
   const user_options_t *user_options = hashcat_ctx->user_options;
 
-  if (user_options->attack_mode != ATTACK_MODE_HYBRID)
+  if ((user_options->attack_mode != ATTACK_MODE_HYBRID) && (mask_feed_kind (user_options) != MASK_FEED_HYBRID))
   {
     event_log_error (hashcat_ctx, "?q is supported in attack-mode 12 only. Failed mask: %s", mask_buf);
 
@@ -652,7 +657,9 @@ static int mp_gen_css (hashcat_ctx_t *hashcat_ctx, char *mask_buf, size_t mask_l
   // in this mode. Checked here rather than at option parsing time because a mask file supplies masks
   // one at a time and every one of them has to carry the marker.
 
-  if ((hashcat_ctx->user_options->attack_mode == ATTACK_MODE_HYBRID) && (mask_ctx->has_w == false))
+  const bool wants_w = (hashcat_ctx->user_options->attack_mode == ATTACK_MODE_HYBRID) || (mask_feed_kind (hashcat_ctx->user_options) == MASK_FEED_HYBRID);
+
+  if ((wants_w == true) && (mask_ctx->has_w == false))
   {
     event_log_error (hashcat_ctx, "Attack-mode 12 needs a ?w in the mask to say where the word goes. Failed mask: %s", mask_buf);
 
@@ -779,7 +786,10 @@ static void mp_setup_sys (cs_t *mp_sys)
                                                    mp_sys[7].cs_len = pos; }
 }
 
-static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr, const char *buf, const u32 userindex)
+// A charset given as text belongs to whoever gave it: the command line for -1 to -8, the mask file
+// for a charset field on one of its lines. rc_error says which, and a charset file is always the task.
+
+static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr, const char *buf, const u32 userindex, const rc_final_t rc_error)
 {
   HCFILE fp;
 
@@ -787,7 +797,12 @@ static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr,
   {
     const int rc = mp_expand (hashcat_ctx, buf, strlen (buf), mp_sys, mp_usr, userindex, 1);
 
-    if (rc == -1) return -1;
+    if (rc == -1)
+    {
+      status_set_rc_error (hashcat_ctx, rc_error);
+
+      return -1;
+    }
   }
   else
   {
@@ -805,6 +820,11 @@ static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr,
 
       hc_fclose (&fp);
 
+      // A directory opens, and then reads as an error or as no end, so this is where one given as a
+      // charset ends up. It is the command's, as a directory is everywhere else.
+
+      status_set_rc_error (hashcat_ctx, (hc_path_is_directory (buf) == true) ? RC_FINAL_ERROR_COMMAND : RC_FINAL_ERROR_TASK);
+
       return -1;
     }
 
@@ -814,6 +834,8 @@ static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr,
 
       hc_fclose (&fp);
 
+      status_set_rc_error (hashcat_ctx, (hc_path_is_directory (buf) == true) ? RC_FINAL_ERROR_COMMAND : RC_FINAL_ERROR_TASK);
+
       return -1;
     }
 
@@ -822,6 +844,8 @@ static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr,
     if (nread == 0)
     {
       event_log_error (hashcat_ctx, "%s: Custom charset file is empty.", buf);
+
+      status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
 
       return -1;
     }
@@ -834,12 +858,19 @@ static int mp_setup_usr (hashcat_ctx_t *hashcat_ctx, cs_t *mp_sys, cs_t *mp_usr,
     {
       event_log_error (hashcat_ctx, "%s: Custom charset file is corrupted.", buf);
 
+      status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
+
       return -1;
     }
 
     const int rc = mp_expand (hashcat_ctx, mp_file, len, mp_sys, mp_usr, userindex, 0);
 
-    if (rc == -1) return -1;
+    if (rc == -1)
+    {
+      status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
+
+      return -1;
+    }
   }
 
   return 0;
@@ -850,6 +881,105 @@ static void mp_reset_usr (cs_t *mp_usr, const u32 userindex)
   mp_usr[userindex].cs_len = 0;
 
   memset (mp_usr[userindex].cs_buf, 0, sizeof (mp_usr[userindex].cs_buf));
+}
+
+// The characters a mask allows at each of its positions. A feed that filters what it produces by a
+// mask, or tests a candidate against one, wants the charsets rather than the candidate generator, and
+// this is the second and last part of the mask processor a plugin may reach.
+//
+// It is the same parser -a 3 uses, so ?a, a custom charset given with -1 through -8, a charset read
+// from a file and an uppercase only hash mode all mean here what they mean there. Writing a second
+// parser instead is how the two come to disagree about what a mask says.
+
+HC_PLUGIN_API int mask_css_parse (hashcat_ctx_t *hashcat_ctx, const char *mask, cs_t *css_buf, const u32 css_max, u32 *css_cnt)
+{
+  if (hashcat_ctx == NULL) return -1;
+
+  // The parser clears and fills a fixed 256 entries whatever the mask holds, so a caller that sized its
+  // buffer for the mask it wrote rather than for the parser would be written past. Asked for rather than
+  // assumed, because this is an entry point a feed outside this tree also calls.
+
+  if (css_max < 256) return -1;
+
+  mask_ctx_t *mask_ctx = hashcat_ctx->mask_ctx;
+
+  if (mask_ctx == NULL) return -1;
+
+  if (hashcat_ctx->hashconfig == NULL) return -1;
+
+  const user_options_t *user_options = hashcat_ctx->user_options;
+
+  // Charsets of this call's own, not the mask context's. An attack mode that walks no mask never
+  // allocates those, and one that does owns them for its own rounds.
+
+  cs_t *mp_sys = (cs_t *) hccalloc (8, sizeof (cs_t));
+  cs_t *mp_usr = (cs_t *) hccalloc (8, sizeof (cs_t));
+
+  if ((mp_sys == NULL) || (mp_usr == NULL))
+  {
+    hcfree (mp_sys);
+    hcfree (mp_usr);
+
+    return -1;
+  }
+
+  // mp_gen_css () records the markers it passes in the mask context, so what a round of a mask attack
+  // put there is put back before returning.
+
+  const bool was_w = mask_ctx->has_w;
+  const bool was_q = mask_ctx->has_q;
+
+  const u32 was_pre = mask_ctx->pre_len;
+  const u32 was_mid = mask_ctx->mid_len;
+
+  int rc = 0;
+
+  mp_setup_sys (mp_sys);
+
+  if (user_options->custom_charset_1) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_1, 0, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_2) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_2, 1, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_3) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_3, 2, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_4) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_4, 3, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_5) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_5, 4, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_6) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_6, 5, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_7) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_7, 6, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+  if (user_options->custom_charset_8) { if (mp_setup_usr (hashcat_ctx, mp_sys, mp_usr, user_options->custom_charset_8, 7, RC_FINAL_ERROR_COMMAND) == -1) rc = -1; }
+
+  // A copy because mp_gen_css () takes it non const, which it does for its callers rather than because it
+  // writes to it.
+
+  char *tmp = (rc == 0) ? hcstrdup (mask) : NULL;
+
+  if (tmp != NULL)
+  {
+    rc = mp_gen_css (hashcat_ctx, tmp, strlen (tmp), mp_sys, mp_usr, css_buf, css_cnt);
+
+    hcfree (tmp);
+  }
+  else
+  {
+    rc = -1;
+  }
+
+  // A ?w or a ?q says where a word goes, which is a question a hybrid attack asks. Nothing is being
+  // placed here, so a marker would quietly stand for no position at all.
+
+  if ((rc == 0) && ((mask_ctx->has_w == true) || (mask_ctx->has_q == true)))
+  {
+    event_log_error (hashcat_ctx, "This mask cannot carry a ?w or a ?q, because it selects candidates rather than placing a word.");
+
+    rc = -1;
+  }
+
+  mask_ctx->has_w   = was_w;
+  mask_ctx->has_q   = was_q;
+  mask_ctx->pre_len = was_pre;
+  mask_ctx->mid_len = was_mid;
+
+  hcfree (mp_sys);
+  hcfree (mp_usr);
+
+  return rc;
 }
 
 static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
@@ -868,6 +998,15 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
   hcstat_table_t *root_table_buf   = mask_ctx->root_table_buf;
   hcstat_table_t *markov_table_buf = mask_ctx->markov_table_buf;
 
+  // Every pass below is bounded by this rather than by SP_PW_MAX. The markov index is
+  // pw_pos * CHARSIZ * CHARSIZ + prev * CHARSIZ + cur, so the position is the outermost dimension and
+  // the slices a run can reach are a prefix. That is what lets the decompression stop early as well as
+  // the loops: a prefix of the stream is a shorter read, not a strided one.
+
+  const u32 markov_pos_cnt = mask_ctx->sp_pw_max_used;
+
+  const u64 markov_cnt = (u64) markov_pos_cnt * CHARSIZ * CHARSIZ;
+
   /**
    * Initialize hcstats
    */
@@ -885,13 +1024,13 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
     root_stats_ptr += CHARSIZ;
   }
 
-  u64 *markov_stats_buf = (u64 *) hccalloc (SP_MARKOV_CNT, sizeof (u64));
+  u64 *markov_stats_buf = (u64 *) hccalloc (markov_cnt, sizeof (u64));
 
   u64 *markov_stats_ptr = markov_stats_buf;
 
-  u64 *(*markov_stats_buf_by_key)[CHARSIZ] = (u64 *(*)[CHARSIZ]) hcmalloc (SP_PW_MAX * sizeof (*markov_stats_buf_by_key));
+  u64 *(*markov_stats_buf_by_key)[CHARSIZ] = (u64 *(*)[CHARSIZ]) hcmalloc (markov_pos_cnt * sizeof (*markov_stats_buf_by_key));
 
-  for (int i = 0; i < SP_PW_MAX; i++)
+  for (u32 i = 0; i < markov_pos_cnt; i++)
   {
     for (int j = 0; j < CHARSIZ; j++)
     {
@@ -961,9 +1100,15 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
 
   hc_fclose (&fp);
 
-  u8 *outbuf = (u8 *) hcmalloc (SP_FILESZ);
+  // Header, the whole root table, then only the markov slices this run can address. hc_lzma2_decompress
+  // fills the buffer it is given and reports what it wrote, and it is asked whether it filled it, so a
+  // short buffer is a request for a prefix rather than a failure.
 
-  size_t outlen = SP_FILESZ;
+  const size_t want_len = (sizeof (u64) * 2) + (sizeof (u64) * SP_ROOT_CNT) + (sizeof (u64) * markov_cnt);
+
+  u8 *outbuf = (u8 *) hcmalloc (want_len);
+
+  size_t outlen = want_len;
 
   const char props = 0x1c; // lzma properties constant, retrieved with 7z2hashcat
 
@@ -1007,7 +1152,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
     return -1;
   }
 
-  if (outlen != SP_FILESZ)
+  if (outlen != want_len)
   {
     event_log_error (hashcat_ctx, "%s: Could not uncompress data.", hcstat);
 
@@ -1027,7 +1172,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
   u64 z = *ptr++;
 
   memcpy (root_stats_buf,   ptr, sizeof (u64) * SP_ROOT_CNT);   ptr += SP_ROOT_CNT;
-  memcpy (markov_stats_buf, ptr, sizeof (u64) * SP_MARKOV_CNT); // ptr += SP_MARKOV_CNT;
+  memcpy (markov_stats_buf, ptr, sizeof (u64) * markov_cnt); // ptr += markov_cnt;
 
   hcfree (inbuf);
   hcfree (outbuf);
@@ -1040,7 +1185,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
   z = byte_swap_64 (z);
 
   for (int i = 0; i < SP_ROOT_CNT; i++)   root_stats_buf[i]   = byte_swap_64 (root_stats_buf[i]);
-  for (int i = 0; i < SP_MARKOV_CNT; i++) markov_stats_buf[i] = byte_swap_64 (markov_stats_buf[i]);
+  for (u64 i = 0; i < markov_cnt; i++)    markov_stats_buf[i] = byte_swap_64 (markov_stats_buf[i]);
 
   /**
    * markov inverse: https://github.com/hashcat/hashcat/issues/1058
@@ -1049,7 +1194,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
   if (inverse == true)
   {
     for (int i = 0; i < SP_ROOT_CNT; i++)   root_stats_buf[i]   = 0 - (1 + root_stats_buf[i]);
-    for (int i = 0; i < SP_MARKOV_CNT; i++) markov_stats_buf[i] = 0 - (1 + markov_stats_buf[i]);
+    for (u64 i = 0; i < markov_cnt; i++)    markov_stats_buf[i] = 0 - (1 + markov_stats_buf[i]);
   }
 
   /**
@@ -1085,7 +1230,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
   if (markov == false)
   {
     memset (root_stats_buf,   0, SP_ROOT_CNT   * sizeof (u64));
-    memset (markov_stats_buf, 0, SP_MARKOV_CNT * sizeof (u64));
+    memset (markov_stats_buf, 0, markov_cnt * sizeof (u64));
   }
 
   if (classic)
@@ -1103,7 +1248,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
       }
     }
 
-    for (int i = 1; i < SP_PW_MAX; i++)
+    for (u32 i = 1; i < markov_pos_cnt; i++)
     {
       u64 *out = markov_stats_buf_by_key[0][0];
       u64 *in  = markov_stats_buf_by_key[i][0];
@@ -1124,7 +1269,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
       memcpy (root_stats_buf_by_pos[i], root_stats_buf_by_pos[0], CHARSIZ * sizeof (u64));
     }
 
-    for (int i = 1; i < SP_PW_MAX; i++)
+    for (u32 i = 1; i < markov_pos_cnt; i++)
     {
       memcpy (markov_stats_buf_by_key[i][0], markov_stats_buf_by_key[0][0], CHARSIZ * CHARSIZ * sizeof (u64));
     }
@@ -1147,9 +1292,9 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
 
   hcstat_table_t *markov_table_ptr = markov_table_buf;
 
-  hcstat_table_t *(*markov_table_buf_by_key)[CHARSIZ] = (hcstat_table_t *(*)[CHARSIZ]) hcmalloc (SP_PW_MAX * sizeof (*markov_table_buf_by_key));
+  hcstat_table_t *(*markov_table_buf_by_key)[CHARSIZ] = (hcstat_table_t *(*)[CHARSIZ]) hcmalloc (markov_pos_cnt * sizeof (*markov_table_buf_by_key));
 
-  for (int i = 0; i < SP_PW_MAX; i++)
+  for (u32 i = 0; i < markov_pos_cnt; i++)
   {
     for (int j = 0; j < CHARSIZ; j++)
     {
@@ -1171,7 +1316,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
     root_table_buf[i].val = root_stats_buf[i];
   }
 
-  for (int i = 0; i < SP_MARKOV_CNT; i++)
+  for (u64 i = 0; i < markov_cnt; i++)
   {
     u32 key = i % CHARSIZ;
 
@@ -1193,7 +1338,7 @@ static int sp_setup_tbl (hashcat_ctx_t *hashcat_ctx)
     qsort (root_table_buf_by_pos[i], CHARSIZ, sizeof (hcstat_table_t), sp_comp_val);
   }
 
-  for (int i = 0; i < SP_PW_MAX; i++)
+  for (u32 i = 0; i < markov_pos_cnt; i++)
   {
     for (int j = 0; j < CHARSIZ; j++)
     {
@@ -1224,10 +1369,32 @@ static int sp_get_sum (u32 start, u32 stop, cs_t *root_css_buf, u64 *result)
   return 0;
 }
 
-static void sp_tbl_to_css (hcstat_table_t *root_table_buf, hcstat_table_t *markov_table_buf, cs_t *root_css_buf, cs_t *markov_css_buf, u32 threshold, u32 **uniq_tbls)
+// css_cnt bounds the markov half of the work. The table has one cs_t per (position, previous
+// character), and a round only ever reads the rows belonging to its own positions: sp_exec () and
+// generate_pw () index markov_css_buf[(i * CHARSIZ) + k] for i below css_cnt.
+//
+// markov_max is how many positions mask_ctx_init () allocated markov_css_buf for, on the host and on
+// each device. It is a maximum over the whole mask queue, taken with mp_css_utf16le_expand () and
+// mp_css_append_salt () allowed for, so no round can exceed it. Clamping css_cnt to it would hide a
+// round that did, because the readers above have no bound of their own, so this checks instead.
+//
+// The root half stays whole. It is 256 entries against 65536, so there is nothing to win and one
+// less thing to reason about.
+
+static int sp_tbl_to_css (hashcat_ctx_t *hashcat_ctx, hcstat_table_t *root_table_buf, hcstat_table_t *markov_table_buf, cs_t *root_css_buf, cs_t *markov_css_buf, u32 threshold, u32 **uniq_tbls, const u32 css_cnt, const u32 markov_max)
 {
-  memset (root_css_buf,   0, SP_PW_MAX *           sizeof (cs_t));
-  memset (markov_css_buf, 0, SP_PW_MAX * CHARSIZ * sizeof (cs_t));
+  if (css_cnt > markov_max)
+  {
+    event_log_error (hashcat_ctx, "Mask reaches %u character positions, but only %u were prepared.", css_cnt, markov_max);
+
+    return -1;
+  }
+
+  const u32 markov_cnt = css_cnt * CHARSIZ * CHARSIZ;
+
+  memset (root_css_buf, 0, SP_PW_MAX * sizeof (cs_t));
+
+  if (css_cnt > 0) memset (markov_css_buf, 0, (size_t) css_cnt * CHARSIZ * sizeof (cs_t));
 
   /**
    * Convert tables to css
@@ -1254,7 +1421,7 @@ static void sp_tbl_to_css (hcstat_table_t *root_table_buf, hcstat_table_t *marko
    * Convert table to css
    */
 
-  for (u32 i = 0; i < SP_MARKOV_CNT; i++)
+  for (u32 i = 0; i < markov_cnt; i++)
   {
     u32 c = i / CHARSIZ;
 
@@ -1289,6 +1456,8 @@ static void sp_tbl_to_css (hcstat_table_t *root_table_buf, hcstat_table_t *marko
     }
   }
   */
+
+  return 0;
 }
 
 void sp_exec (u64 ctx, char *pw_buf, cs_t *root_css_buf, cs_t *markov_css_buf, u32 start, u32 stop)
@@ -1454,6 +1623,13 @@ static void mask_ctx_lookup (hashcat_ctx_t *hashcat_ctx, const u32 css_cnt_orig,
     lookup->uppered = true;
   }
 
+  if (hashconfig->opts_type & OPTS_TYPE_PT_LOWER)
+  {
+    for (u32 i = 0; i < cand_len; i++) cand[i] = (u8) tolower (cand[i]);
+
+    lookup->lowered = true;
+  }
+
   // The candidate as the mask spells it. A mode that hashes UTF-16 has had its css expanded to two
   // entries per character, one of them a fixed zero, and the run compares against that rather than
   // against what the user typed.
@@ -1588,6 +1764,11 @@ static u32 hybrid_append (u8 *out_buf, const u32 out_len, const u8 *src, const u
 
   const u32 copy_len = MIN (src_len, PW_MAX - out_len);
 
+  // an absent piece is passed as NULL with a length of 0, and memcpy () must not be handed NULL even
+  // for 0 bytes
+
+  if (copy_len == 0) return 0;
+
   memcpy (out_buf + out_len, src, copy_len);
 
   return copy_len;
@@ -1693,7 +1874,7 @@ u32 hybrid_assemble (hashcat_ctx_t *hashcat_ctx, u8 *out_buf, const char *mask_b
   return out_len;
 }
 
-static int mask_append_final (hashcat_ctx_t *hashcat_ctx, const char *mask)
+static int mask_append_final (hashcat_ctx_t *hashcat_ctx, const char *mask, const size_t mask_pos)
 {
   mask_ctx_t *mask_ctx = hashcat_ctx->mask_ctx;
 
@@ -1712,17 +1893,27 @@ static int mask_append_final (hashcat_ctx_t *hashcat_ctx, const char *mask)
 
   // -a 6 and -a 7 are -a 12 masks with the ?w at one end, and this is where it goes on. Here rather
   // than on the argument, because every mask arrives here and this is the last thing that happens to
-  // one: a mask file line arrives with its own charsets already split off, and an --increment mask
-  // arrives already truncated and already mirrored. So -i keeps working for both of them with no
-  // change to the increment machinery at all.
+  // one: an --increment mask arrives already truncated and already mirrored, so -i keeps working with
+  // no change to the increment machinery at all. A mask file line still carries its charsets in front
+  // of the mask, and mask_pos is where the mask itself starts, so a leading ?w goes there and not
+  // into the first charset.
 
   char mask_buf[256];
 
   if (user_options->marker_policy != MARKER_POLICY_NONE)
   {
-    const char *fmt = (user_options->marker_policy == MARKER_POLICY_PREFIX_W) ? "?w%s" : "%s?w";
+    int mask_buf_len = 0;
 
-    if (snprintf (mask_buf, sizeof (mask_buf), fmt, mask) >= (int) sizeof (mask_buf))
+    if (user_options->marker_policy == MARKER_POLICY_PREFIX_W)
+    {
+      mask_buf_len = snprintf (mask_buf, sizeof (mask_buf), "%.*s?w%s", (int) mask_pos, mask, mask + mask_pos);
+    }
+    else
+    {
+      mask_buf_len = snprintf (mask_buf, sizeof (mask_buf), "%s?w", mask);
+    }
+
+    if (mask_buf_len >= (int) sizeof (mask_buf))
     {
       event_log_error (hashcat_ctx, "%s: mask is too long.", mask);
 
@@ -1833,6 +2024,11 @@ static int mask_append (hashcat_ctx_t *hashcat_ctx, const char *mask, const char
         mask_truncated_next += prepend_len;
       }
 
+      // reverseMask () below hands back a new buffer that starts with the same prefix, so the offset
+      // of the mask is taken here, while mask_truncated_next still points into this one.
+
+      const size_t mask_pos = (size_t) (mask_truncated_next - mask_truncated);
+
       if (user_options->increment == INCREMENT_INVERSED)
       {
         if (mp_get_truncated_mask (hashcat_ctx, reverseMask (mask, ""), strlen (mask), increment_len, mask_truncated_next, 256 - (size_t) (mask_truncated_next - mask_truncated)) == -1)
@@ -1861,7 +2057,7 @@ static int mask_append (hashcat_ctx_t *hashcat_ctx, const char *mask, const char
         }
       }
 
-      const int rc = mask_append_final (hashcat_ctx, mask_truncated);
+      const int rc = mask_append_final (hashcat_ctx, mask_truncated, mask_pos);
 
       hcfree (mask_truncated);
 
@@ -1878,7 +2074,7 @@ static int mask_append (hashcat_ctx_t *hashcat_ctx, const char *mask, const char
 
       hc_asprintf (&prepend_mask, "%s,%s", prepend, mask);
 
-      const int rc = mask_append_final (hashcat_ctx, prepend_mask);
+      const int rc = mask_append_final (hashcat_ctx, prepend_mask, strlen (prepend) + 1);
 
       hcfree (prepend_mask);
 
@@ -1886,11 +2082,47 @@ static int mask_append (hashcat_ctx_t *hashcat_ctx, const char *mask, const char
     }
     else
     {
-      if (mask_append_final (hashcat_ctx, mask) == -1) return -1;
+      if (mask_append_final (hashcat_ctx, mask, 0) == -1) return -1;
     }
   }
 
   return 0;
+}
+
+// Whether the mask is a feed's source rather than the device's own generator.
+//
+// -a 3 given rules cannot generate on the device, because no kernel both walks a mask and applies a
+// rule, so user_options_alias_attack_mode () rewrites it to -a 8 with the mask feed and the rules
+// amplify the feed's candidates the way they do for every other feed. attack_mode_typed is what the
+// user asked for and survives the rewrite, so the pair is what identifies the case.
+//
+// Everything the mask processor does is still wanted here. The one thing it must not do is cut the
+// mask in two so that a suffix is generated on the device, because under the feed there is no
+// device side to generate it.
+
+mask_feed_kind_t mask_feed_kind (const user_options_t *user_options)
+{
+  if (user_options->attack_mode != ATTACK_MODE_GENERIC) return MASK_FEED_NONE;
+
+  // What the user typed is what says which feed this is, because the rewrite has already happened by
+  // the time anyone asks. -a 1, -a 6 and -a 7 are one attack below the option parser, so all four of
+  // the hybrid shapes answer together.
+
+  if (user_options->attack_mode_typed == ATTACK_MODE_BF) return MASK_FEED_MASK;
+
+  if (user_options->attack_mode_typed == ATTACK_MODE_COMBI)   return MASK_FEED_HYBRID;
+  if (user_options->attack_mode_typed == ATTACK_MODE_HYBRID1) return MASK_FEED_HYBRID;
+  if (user_options->attack_mode_typed == ATTACK_MODE_HYBRID2) return MASK_FEED_HYBRID;
+  if (user_options->attack_mode_typed == ATTACK_MODE_HYBRID)  return MASK_FEED_HYBRID;
+
+  return MASK_FEED_NONE;
+}
+
+bool mask_is_feed (const user_options_t *user_options)
+{
+  const bool is_feed = (mask_feed_kind (user_options) != MASK_FEED_NONE);
+
+  return is_feed;
 }
 
 u32 mp_get_length (const char *mask, const u32 opts_type)
@@ -2032,7 +2264,147 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
   user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
   user_options_t       *user_options       = hashcat_ctx->user_options;
 
-  if (user_options_extra->attack_kern == ATTACK_KERN_COMBI)
+  // A mask typed on the command line is part of the attack command. One read from a mask file is
+  // part of the task.
+
+  const rc_final_t mask_error = (mask_ctx->mask_from_file == true) ? RC_FINAL_ERROR_TASK : RC_FINAL_ERROR_COMMAND;
+
+  // The two feeds are asked about first, because their attack_kern is ATTACK_KERN_STRAIGHT and they
+  // would answer neither of the two tests below.
+
+  if (mask_feed_kind (user_options) == MASK_FEED_HYBRID)
+  {
+    mask_ctx->mask = mask_ctx->masks[mask_ctx->masks_pos];
+
+    if (mask_ctx_parse_maskfile (hashcat_ctx) == -1)
+    {
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+
+    // This is where the markers are found, so has_w, has_q, pre_len and mid_len are settled by it,
+    // and those are what say where the words go in the candidate.
+
+    if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1)
+    {
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+
+    // No length check on the mask here, unlike the other three arms. The mask is one piece of the
+    // candidate and the words are the rest, so a three character mask under a hash mode with an
+    // eight character minimum is not too short: it is a mask that will be given five more.
+
+    u32 **uniq_tbls = (u32 **) hcmalloc (SP_PW_MAX * sizeof (u32 *));
+
+    for (int i = 0; i < SP_PW_MAX; i++) uniq_tbls[i] = (u32 *) hcmalloc (CHARSIZ * sizeof (u32));
+
+    mp_css_to_uniq_tbl (hashcat_ctx, mask_ctx->css_cnt, mask_ctx->css_buf, uniq_tbls);
+
+    const int rc_tbl_to_css = sp_tbl_to_css (hashcat_ctx, mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls, mask_ctx->css_cnt, mask_ctx->sp_pw_max_used);
+
+    for (int i = 0; i < SP_PW_MAX; i++) hcfree (uniq_tbls[i]);
+
+    hcfree (uniq_tbls);
+
+    if (rc_tbl_to_css == -1) return -1;
+
+    // How many values this mask holds, and nothing else. The ?q wordlist is not multiplied in here
+    // the way the combinator arm multiplies it, because the feed owns both wordlists and counts them
+    // itself. What the feed cannot count is the mask, so that is what this reports.
+
+    if (sp_get_sum (0, mask_ctx->css_cnt, mask_ctx->root_css_buf, &mask_ctx->feed_keyspace) == -1)
+    {
+      event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+
+    // Nothing carries any of this to a device. There is no combinator on the device to tell about
+    // the mask pieces, no mask processor kernel to load the tables into, and the css buffers are
+    // allocated four bytes wide for a straight kernel, so writing them over would be a write into an
+    // allocation that was never made for them.
+  }
+  else if (mask_feed_kind (user_options) == MASK_FEED_MASK)
+  {
+    mask_ctx->mask = mask_ctx->masks[mask_ctx->masks_pos];
+
+    if (mask_ctx_parse_maskfile (hashcat_ctx) == -1)
+    {
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+
+    if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1)
+    {
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+
+    // A mask the hash mode cannot take is passed over rather than run, exactly as it is for -a 3.
+    // The rules do not change which lengths the mode accepts: they are applied to this candidate on
+    // the device and a rule that lengthens it is the mode's business, not the mask's.
+
+    if ((mask_ctx->css_cnt < hashconfig->pw_min) || (mask_ctx->css_cnt > hashconfig->pw_max))
+    {
+      if (mask_ctx->css_cnt < hashconfig->pw_min)
+      {
+        event_log_warning (hashcat_ctx, "Skipping mask '%s' because it is smaller than the minimum password length.", mask_ctx->mask);
+        event_log_warning (hashcat_ctx, NULL);
+      }
+
+      if (mask_ctx->css_cnt > hashconfig->pw_max)
+      {
+        event_log_warning (hashcat_ctx, "Skipping mask '%s' because it is larger than the maximum password length.", mask_ctx->mask);
+        event_log_warning (hashcat_ctx, NULL);
+      }
+
+      mask_ctx->lookup.skipped++;
+
+      logfile_sub_msg ("STOP");
+
+      return -1;
+    }
+
+    // No utf16 expansion and no appended salt. Both rewrite the mask into the bytes the kernel wants
+    // to see, and what the kernel is given here is a base word that the rule engine will rewrite
+    // again. Expanding it first would have the rule mangle the padding, and appending the salt first
+    // would have the rule mangle the salt.
+
+    u32 **uniq_tbls = (u32 **) hcmalloc (SP_PW_MAX * sizeof (u32 *));
+
+    for (int i = 0; i < SP_PW_MAX; i++) uniq_tbls[i] = (u32 *) hcmalloc (CHARSIZ * sizeof (u32));
+
+    mp_css_to_uniq_tbl (hashcat_ctx, mask_ctx->css_cnt, mask_ctx->css_buf, uniq_tbls);
+
+    const int rc_tbl_to_css = sp_tbl_to_css (hashcat_ctx, mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls, mask_ctx->css_cnt, mask_ctx->sp_pw_max_used);
+
+    for (int i = 0; i < SP_PW_MAX; i++) hcfree (uniq_tbls[i]);
+
+    hcfree (uniq_tbls);
+
+    if (rc_tbl_to_css == -1) return -1;
+
+    // The whole mask, because the feed produces the whole candidate. status_ctx->words_cnt is not
+    // set here: the feed reports this as its keyspace and straight_ctx_update_loop multiplies it by
+    // the rule count, which is the same arrangement every other feed is counted under.
+
+    if (sp_get_sum (0, mask_ctx->css_cnt, mask_ctx->root_css_buf, &mask_ctx->feed_keyspace) == -1)
+    {
+      event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
+  }
+  else if (user_options_extra->attack_kern == ATTACK_KERN_COMBI)
   {
   // The mask is the base word source, so its size is the base word count and the amplifier count
     // belongs to the wordlist. That is -a 7 under a pure kernel, and -a 12 under a pure kernel
@@ -2042,9 +2414,19 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
     {
       mask_ctx->mask = mask_ctx->masks[mask_ctx->masks_pos];
 
-      if (mask_ctx_parse_maskfile (hashcat_ctx) == -1) return -1;
+      if (mask_ctx_parse_maskfile (hashcat_ctx) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, mask_error);
 
-      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1) return -1;
+        return -1;
+      }
+
+      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, mask_error);
+
+        return -1;
+      }
 
       u32 **uniq_tbls = (u32 **) hcmalloc (SP_PW_MAX * sizeof(u32 *));
 
@@ -2052,15 +2434,19 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
 
       mp_css_to_uniq_tbl (hashcat_ctx, mask_ctx->css_cnt, mask_ctx->css_buf, uniq_tbls);
 
-      sp_tbl_to_css (mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls);
+      const int rc_tbl_to_css = sp_tbl_to_css (hashcat_ctx, mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls, mask_ctx->css_cnt, mask_ctx->sp_pw_max_used);
 
       for (int i = 0; i < SP_PW_MAX; i++) hcfree (uniq_tbls[i]);
 
       hcfree (uniq_tbls);
 
+      if (rc_tbl_to_css == -1) return -1;
+
       if (sp_get_sum (0, mask_ctx->css_cnt, mask_ctx->root_css_buf, &mask_ctx->bfs_cnt) == -1)
       {
         event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+        status_set_rc_error (hashcat_ctx, mask_error);
 
         return -1;
       }
@@ -2071,9 +2457,19 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
     {
       mask_ctx->mask = mask_ctx->masks[mask_ctx->masks_pos];
 
-      if (mask_ctx_parse_maskfile (hashcat_ctx) == -1) return -1;
+      if (mask_ctx_parse_maskfile (hashcat_ctx) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, mask_error);
 
-      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1) return -1;
+        return -1;
+      }
+
+      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, mask_error);
+
+        return -1;
+      }
 
       u32 **uniq_tbls = (u32 **) hcmalloc (SP_PW_MAX * sizeof(u32 *));
 
@@ -2081,15 +2477,19 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
 
       mp_css_to_uniq_tbl (hashcat_ctx, mask_ctx->css_cnt, mask_ctx->css_buf, uniq_tbls);
 
-      sp_tbl_to_css (mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls);
+      const int rc_tbl_to_css = sp_tbl_to_css (hashcat_ctx, mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls, mask_ctx->css_cnt, mask_ctx->sp_pw_max_used);
 
       for (int i = 0; i < SP_PW_MAX; i++) hcfree (uniq_tbls[i]);
 
       hcfree (uniq_tbls);
 
+      if (rc_tbl_to_css == -1) return -1;
+
       if (sp_get_sum (0, mask_ctx->css_cnt, mask_ctx->root_css_buf, &combinator_ctx->combs_cnt) == -1)
       {
         event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+        status_set_rc_error (hashcat_ctx, mask_error);
 
         return -1;
       }
@@ -2107,6 +2507,8 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
         {
           event_log_error (hashcat_ctx, "?q: feed cannot report a keyspace.");
 
+          status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
           return -1;
         }
 
@@ -2117,12 +2519,16 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
         {
           event_log_error (hashcat_ctx, "%s: has a ?q, but no wordlist was given for it.", mask_ctx->mask);
 
+          status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
           return -1;
         }
 
         if (overflow_check_u64_mul (combinator_ctx->combs_cnt, words_cnt) == true)
         {
           event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+          status_set_rc_error (hashcat_ctx, mask_error);
 
           return -1;
         }
@@ -2202,11 +2608,21 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
   {
     mask_ctx->mask = mask_ctx->masks[mask_ctx->masks_pos];
 
-    if (mask_ctx_parse_maskfile (hashcat_ctx) == -1) return -1;
+    if (mask_ctx_parse_maskfile (hashcat_ctx) == -1)
+    {
+      status_set_rc_error (hashcat_ctx, mask_error);
+
+      return -1;
+    }
 
     if (user_options->attack_mode == ATTACK_MODE_BF) // always true
     {
-      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1) return -1;
+      if (mp_gen_css (hashcat_ctx, mask_ctx->mask, strlen (mask_ctx->mask), mask_ctx->mp_sys, mask_ctx->mp_usr, mask_ctx->css_buf, &mask_ctx->css_cnt) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, mask_error);
+
+        return -1;
+      }
 
       // special case for benchmark
 
@@ -2281,15 +2697,19 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
 
       mp_css_to_uniq_tbl (hashcat_ctx, mask_ctx->css_cnt, mask_ctx->css_buf, uniq_tbls);
 
-      sp_tbl_to_css (mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls);
+      const int rc_tbl_to_css = sp_tbl_to_css (hashcat_ctx, mask_ctx->root_table_buf, mask_ctx->markov_table_buf, mask_ctx->root_css_buf, mask_ctx->markov_css_buf, user_options->markov_threshold, uniq_tbls, mask_ctx->css_cnt, mask_ctx->sp_pw_max_used);
 
       for (int i = 0; i < SP_PW_MAX; i++) hcfree (uniq_tbls[i]);
 
       hcfree (uniq_tbls);
 
+      if (rc_tbl_to_css == -1) return -1;
+
       if (sp_get_sum (0, mask_ctx->css_cnt, mask_ctx->root_css_buf, &status_ctx->words_cnt) == -1)
       {
         event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+        status_set_rc_error (hashcat_ctx, mask_error);
 
         return -1;
       }
@@ -2303,6 +2723,8 @@ int mask_ctx_update_loop (hashcat_ctx_t *hashcat_ctx)
       if (sp_get_sum (0, css_cnt_lr[1], mask_ctx->root_css_buf, &mask_ctx->bfs_cnt) == -1)
       {
         event_log_error (hashcat_ctx, "Integer overflow detected in keyspace of mask: %s", mask_ctx->mask);
+
+        status_set_rc_error (hashcat_ctx, mask_error);
 
         return -1;
       }
@@ -2379,6 +2801,14 @@ static void mask_ctx_lookup_combi (hashcat_ctx_t *hashcat_ctx)
 
   const bool has_q = mask_ctx->has_q;
 
+  // Recorded now rather than with the rest of the answer, because the miss report reads it too and a
+  // miss reaches none of the assignments below. Left until then it stayed at its zero value, so a
+  // -a 1 run that reached nothing was described as a wordlist and a mask rather than as two
+  // wordlists. Nothing above this can clobber a hit: a round that already found one returns at the
+  // top of this function.
+
+  lookup->has_q = has_q;
+
   // The mirror shape: the mask is the base word and the dictionary amplifies it, which is -a 7 under
   // a pure kernel and -a 12 under one when its mask ends in ?w. The rewrite puts the ?w last, so the
   // mask spells the front of the candidate and one word follows it, and there is nothing to split:
@@ -2449,7 +2879,6 @@ static void mask_ctx_lookup_combi (hashcat_ctx_t *hashcat_ctx)
     lookup->amp_cnt   = combinator_ctx->combs_cnt;
     lookup->base_len  = css_cnt;
     lookup->q_len     = word_len;
-    lookup->has_q     = false;
     lookup->mask_base = true;
 
     snprintf (lookup->mask, sizeof (lookup->mask), "%s", mask_ctx->mask);
@@ -2601,7 +3030,6 @@ static void mask_ctx_lookup_combi (hashcat_ctx_t *hashcat_ctx)
   lookup->amp_cnt  = combinator_ctx->combs_cnt;
   lookup->base_len = best_base;
   lookup->q_len    = words_len - best_base;
-  lookup->has_q    = has_q;
 
   snprintf (lookup->mask, sizeof (lookup->mask), "%s", mask_ctx->mask);
 }
@@ -2798,6 +3226,11 @@ void mask_ctx_lookup_report (hashcat_ctx_t *hashcat_ctx)
     event_log_info (hashcat_ctx, "lookup: this mode hashes in upper case, so every candidate in the run is, and this one was folded to match");
   }
 
+  if (lookup->lowered == true)
+  {
+    event_log_info (hashcat_ctx, "lookup: this mode hashes in lower case, so every candidate in the run is, and this one was folded to match");
+  }
+
   // No round was sized at all, so there was nothing to search. A mask outside the mode's password
   // length is skipped before its tables are built, and a queue of nothing but those leaves this.
 
@@ -2922,6 +3355,7 @@ void mask_ctx_lookup_report (hashcat_ctx_t *hashcat_ctx)
 int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
 {
   const hashconfig_t         *hashconfig         = hashcat_ctx->hashconfig;
+  const hashes_t             *hashes             = hashcat_ctx->hashes;
   const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
   const user_options_t       *user_options       = hashcat_ctx->user_options;
   mask_ctx_t                 *mask_ctx           = hashcat_ctx->mask_ctx;
@@ -2937,8 +3371,12 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
   if (user_options->version      == true) return 0;
 
   if (user_options->attack_mode  == ATTACK_MODE_STRAIGHT)    return 0;
-  if (user_options->attack_mode  == ATTACK_MODE_GENERIC)     return 0;
   if (user_options->attack_mode  == ATTACK_MODE_ASSOCIATION) return 0;
+
+  // -a 8 has no mask of its own, except when the mask is what the feed reads. Then the mask
+  // processor is the feed's generator and everything below is still its work to do.
+
+  if ((user_options->attack_mode == ATTACK_MODE_GENERIC) && (mask_is_feed (user_options) == false)) return 0;
 
   mask_ctx->enabled = true;
 
@@ -2949,12 +3387,14 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
   mask_ctx->css_cnt = 0;
 
   mask_ctx->root_table_buf   = (hcstat_table_t *) hccalloc (SP_ROOT_CNT,   sizeof (hcstat_table_t));
-  mask_ctx->markov_table_buf = (hcstat_table_t *) hccalloc (SP_MARKOV_CNT, sizeof (hcstat_table_t));
 
-  if (sp_setup_tbl (hashcat_ctx) == -1) return -1;
+  // markov_table_buf, markov_css_buf and sp_setup_tbl () are at the end of this function rather than
+  // here, because how much of them a run needs is a property of the mask queue and the queue does not
+  // exist yet. Nothing between here and there reads any of them: sp_tbl_to_css () is the only reader
+  // of the tables, sp_exec () and sp_rank () are the only readers of the css, and all three run per
+  // round.
 
-  mask_ctx->root_css_buf   = (cs_t *) hccalloc (SP_PW_MAX,           sizeof (cs_t));
-  mask_ctx->markov_css_buf = (cs_t *) hccalloc (SP_PW_MAX * CHARSIZ, sizeof (cs_t));
+  mask_ctx->root_css_buf   = (cs_t *) hccalloc (SP_PW_MAX, sizeof (cs_t));
 
   mask_ctx->mask_from_file = false;
 
@@ -2972,40 +3412,51 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
 
   mp_setup_sys (mask_ctx->mp_sys);
 
-  if (user_options->custom_charset_1) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_1, 0) == -1) return -1; }
-  if (user_options->custom_charset_2) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_2, 1) == -1) return -1; }
-  if (user_options->custom_charset_3) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_3, 2) == -1) return -1; }
-  if (user_options->custom_charset_4) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_4, 3) == -1) return -1; }
-  if (user_options->custom_charset_5) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_5, 4) == -1) return -1; }
-  if (user_options->custom_charset_6) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_6, 5) == -1) return -1; }
-  if (user_options->custom_charset_7) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_7, 6) == -1) return -1; }
-  if (user_options->custom_charset_8) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_8, 7) == -1) return -1; }
+  if (user_options->custom_charset_1) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_1, 0, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_2) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_2, 1, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_3) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_3, 2, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_4) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_4, 3, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_5) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_5, 4, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_6) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_6, 5, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_7) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_7, 6, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
+  if (user_options->custom_charset_8) { if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_8, 7, RC_FINAL_ERROR_COMMAND) == -1) return -1; }
 
   if (user_options->benchmark == true)
   {
     if (hashconfig->benchmark_charset != NULL)
     {
-      if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, hashconfig->benchmark_charset, 0) == -1) return -1;
+      if (mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, hashconfig->benchmark_charset, 0, RC_FINAL_ERROR_COMMAND) == -1) return -1;
     }
   }
 
-  if (user_options->attack_mode == ATTACK_MODE_BF)
+  if ((user_options->attack_mode == ATTACK_MODE_BF) || (mask_feed_kind (user_options) == MASK_FEED_MASK))
   {
     if (user_options->benchmark == false)
     {
-      if (user_options_extra->hc_workc)
+      // A feed reads its work arguments with the feed name in front of them, so the mask sits one
+      // place further along than it does under -a 3. Everything after it is still the queue: several
+      // masks, or several mask files, are what they always were.
+
+      const int mask_from = (mask_feed_kind (user_options) == MASK_FEED_MASK) ? 1 : 0;
+
+      if (user_options_extra->hc_workc > mask_from)
       {
-        char *arg = user_options_extra->hc_workv[0];
+        char *arg = user_options_extra->hc_workv[mask_from];
 
         if (hc_path_exist (arg) == false)
         {
-          if (mask_append (hashcat_ctx, arg, NULL) == -1) return -1;
+          if (mask_append (hashcat_ctx, arg, NULL) == -1)
+          {
+            status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
+            return -1;
+          }
         }
         else
         {
           mask_ctx->mask_from_file = true;
 
-          for (int i = 0; i < user_options_extra->hc_workc; i++)
+          for (int i = mask_from; i < user_options_extra->hc_workc; i++)
           {
             arg = user_options_extra->hc_workv[i];
 
@@ -3047,6 +3498,8 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
                 {
                   hc_fclose (&mask_fp);
 
+                  status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
+
                   return -1;
                 }
               }
@@ -3058,6 +3511,8 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
             else
             {
               event_log_error (hashcat_ctx, "%s: unsupported file type.", arg);
+
+              status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
 
               return -1;
             }
@@ -3078,19 +3533,29 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
       if (mask_append (hashcat_ctx, mask, NULL) == -1) return -1;
     }
   }
-  else if (user_options->attack_mode == ATTACK_MODE_HYBRID)
+  else if ((user_options->attack_mode == ATTACK_MODE_HYBRID) || (mask_feed_kind (user_options) == MASK_FEED_HYBRID))
   {
     // display
 
-    // -a 6 writes the mask last and -a 12 writes it first, and either way it can be a mask file
+    // The mask is the first work argument, and the dictionaries follow it. The hybrid feed reads the
+    // same arguments with its own name in front of them, so there the mask is one place further
+    // along. Either way it is one argument and it can be a mask file: what comes after it is a
+    // dictionary and must not be read as another mask.
 
-    char *arg = user_options_extra->hc_workv[(user_options->attack_mode == ATTACK_MODE_HYBRID) ? 0 : (user_options_extra->hc_workc - 1)];
+    const int mask_at = (mask_feed_kind (user_options) == MASK_FEED_HYBRID) ? 1 : 0;
+
+    char *arg = user_options_extra->hc_workv[mask_at];
 
     // mod
 
     if (hc_path_exist (arg) == false)
     {
-      if (mask_append (hashcat_ctx, arg, NULL) == -1) return -1;
+      if (mask_append (hashcat_ctx, arg, NULL) == -1)
+      {
+        status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
+        return -1;
+      }
     }
     else
     {
@@ -3134,6 +3599,8 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
           {
             hc_fclose (&mask_fp);
 
+            status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
+
             return -1;
           }
         }
@@ -3146,6 +3613,8 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
       {
         event_log_error (hashcat_ctx, "%s: unsupported file type.", arg);
 
+        status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
         return -1;
       }
     }
@@ -3153,6 +3622,8 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
   if (mask_ctx->masks_cnt == 0)
   {
     event_log_error (hashcat_ctx, "Invalid mask.");
+
+    status_set_rc_error (hashcat_ctx, (mask_ctx->mask_from_file == true) ? RC_FINAL_ERROR_TASK : RC_FINAL_ERROR_COMMAND);
 
     return -1;
   }
@@ -3213,8 +3684,79 @@ int mask_ctx_init (hashcat_ctx_t *hashcat_ctx)
     {
       event_log_error (hashcat_ctx, "%s: given as the wordlist a ?q names, but no mask has a ?q.", user_options_extra->hc_workv[user_options_extra->hc_workc - 1]);
 
+      status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_COMMAND);
+
       return -1;
     }
+  }
+
+  // How far into the markov statistics this queue can reach, and therefore how much of them is worth
+  // building. A mask string is never shorter than the number of positions it produces, so the longest
+  // string in the queue bounds the longest css_cnt without parsing a single mask: ?l and ?1 spend two
+  // characters on one position, ?w and ?q spend two on none, and a maskfile line's charset prefix
+  // spends characters on none. What comes after mp_gen_css () can still grow css_cnt, so both of those
+  // are allowed for: the utf16 expansion at most doubles it, and an appended salt adds its own length.
+  //
+  // Erring high is free and erring low is not, which is why this is a strlen bound and not a parse.
+
+  u32 want = 0;
+
+  for (u32 mask_pos = 0; mask_pos < mask_ctx->masks_cnt; mask_pos++)
+  {
+    const char *mask = mask_ctx->masks[mask_pos];
+
+    u32 mask_len = mp_get_length (mask, hashconfig->opts_type);
+
+    // mp_get_length () counts the positions a mask spells, so it already reads ?l and ?1 as one and an
+    // escaped ?? as one rather than as a marker, and it counts a hex mask at its own rate. What it does
+    // not do is drop the markers, because a ?w or a ?q spells nothing. The two helpers find a marker at
+    // either end, which is where the three attack modes rewritten into this one put theirs.
+    //
+    // A marker in the middle, which only -a 12 can write, is seen by neither helper and leaves the
+    // count one high per marker. That is the safe direction.
+
+    if ((mask_starts_with_marker (mask, 'w') == true) && (mask_len > 0)) mask_len--;
+    if ((mask_ends_with_marker   (mask, 'w') == true) && (mask_len > 0)) mask_len--;
+    if ((mask_starts_with_marker (mask, 'q') == true) && (mask_len > 0)) mask_len--;
+    if ((mask_ends_with_marker   (mask, 'q') == true) && (mask_len > 0)) mask_len--;
+
+    if (mask_len > want) want = mask_len;
+  }
+
+  // Only a mode that hashes the candidate as utf16 doubles css_cnt, and only mp_css_utf16le_expand ()
+  // and its big endian twin do the doubling, so this is the one place it belongs.
+
+  if (hashconfig->opts_type & (OPTS_TYPE_PT_UTF16LE | OPTS_TYPE_PT_UTF16BE)) want *= 2;
+
+  if ((hashconfig->opti_type & OPTI_TYPE_SINGLE_HASH) && (hashconfig->opti_type & OPTI_TYPE_APPENDED_SALT))
+  {
+    want += hashes->salts_buf[0].salt_len;
+  }
+
+  // --markov-classic sums every position into the first one and then copies the first back over all of
+  // them, so its answer for any position depends on all 256. It is the one option that genuinely needs
+  // the whole table, and it keeps it.
+
+  if (user_options->markov_classic == true) want = SP_PW_MAX;
+
+  mask_ctx->sp_pw_max_used = MIN (want, SP_PW_MAX);
+
+  // A queue whose masks are all markers reaches no position at all, which is what -a 1 is: it arrives
+  // here as the mask ?w?q. mp_css_to_uniq_tbl () then marks nothing, so both loops in sp_tbl_to_css ()
+  // add nothing and the tables are never read. Building them would be 128 MB of decompression for a
+  // table with no usable slice in it.
+
+  if (mask_ctx->sp_pw_max_used > 0)
+  {
+    mask_ctx->markov_table_buf = (hcstat_table_t *) hccalloc ((size_t) mask_ctx->sp_pw_max_used * CHARSIZ * CHARSIZ, sizeof (hcstat_table_t));
+
+    // One cs_t per (position, previous character), same as the table it is built from, so the same
+    // bound sizes it. At the full 256 positions this is 67 MB that an eight character mask uses two
+    // of, and it was carried on the host and again on every device.
+
+    mask_ctx->markov_css_buf = (cs_t *) hccalloc ((size_t) mask_ctx->sp_pw_max_used * CHARSIZ, sizeof (cs_t));
+
+    if (sp_setup_tbl (hashcat_ctx) == -1) return -1;
   }
 
   return 0;
@@ -3357,42 +3899,42 @@ int mask_ctx_parse_maskfile (hashcat_ctx_t *hashcat_ctx)
     {
       case 0:
         user_options->custom_charset_1 = mfs_buf[0].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_1, 0);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_1, 0, RC_FINAL_ERROR_TASK);
         break;
 
       case 1:
         user_options->custom_charset_2 = mfs_buf[1].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_2, 1);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_2, 1, RC_FINAL_ERROR_TASK);
         break;
 
       case 2:
         user_options->custom_charset_3 = mfs_buf[2].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_3, 2);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_3, 2, RC_FINAL_ERROR_TASK);
         break;
 
       case 3:
         user_options->custom_charset_4 = mfs_buf[3].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_4, 3);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_4, 3, RC_FINAL_ERROR_TASK);
         break;
 
       case 4:
         user_options->custom_charset_5 = mfs_buf[4].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_5, 4);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_5, 4, RC_FINAL_ERROR_TASK);
         break;
 
       case 5:
         user_options->custom_charset_6 = mfs_buf[5].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_6, 5);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_6, 5, RC_FINAL_ERROR_TASK);
         break;
 
       case 6:
         user_options->custom_charset_7 = mfs_buf[6].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_7, 6);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_7, 6, RC_FINAL_ERROR_TASK);
         break;
 
       case 7:
         user_options->custom_charset_8 = mfs_buf[7].mf_buf;
-        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_8, 7);
+        mp_setup_usr (hashcat_ctx, mask_ctx->mp_sys, mask_ctx->mp_usr, user_options->custom_charset_8, 7, RC_FINAL_ERROR_TASK);
         break;
     }
   }

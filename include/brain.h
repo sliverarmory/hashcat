@@ -19,22 +19,6 @@
 
 #if defined (_WIN)
 
-// The macro is _WIN32_WINNT. It was spelled _WINNT_WIN32 here, so nothing ever read it.
-// Its value selects Windows 7, and ws2tcpip.h only declares inet_ntop from Vista upwards.
-// Recent mingw defaults above that line and declares it regardless, which kept this hidden.
-// Below it the declaration is absent and the call in brain_server falls back to an implicit
-// one. clang rejects that outright and C23 removes it.
-//
-// Only set when nothing has set it already. common.h reaches string.h and therefore the mingw
-// headers, which pick their own value, so by the time this is read the macro is usually already
-// defined and redefining it warns on every file that includes this one. Recent mingw chooses a
-// HIGHER version than the floor wanted here, and a higher version declares everything a lower one
-// does, so leaving it alone is correct as well as quieter.
-
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
-#endif
-
 // winsock2.h first, because ws2tcpip.h builds on it
 
 #include <winsock2.h>
@@ -71,6 +55,11 @@ static const int BRAIN_HASH_SIZE                  = 2 * sizeof (u32);
 
 #define BRAIN_AUTH_ITERATIONS 100000
 #define BRAIN_AUTH_BUFSZ      256
+
+// What a slot of the attack identity holds when the hash-mode in use registered no option for it,
+// see brain_compute_attack (). BRAIN_SLOTS_MAX is in types.h, beside the rows that name a slot.
+
+#define BRAIN_SLOT_UNUSED 0xffffffff
 
 static const int BRAIN_LINK_VERSION_CUR           = 2;
 static const int BRAIN_LINK_VERSION_MIN           = 2;

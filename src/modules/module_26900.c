@@ -22,6 +22,7 @@ static const u32   DGST_SIZE      = DGST_SIZE_8_4;
 static const u32   HASH_CATEGORY  = HASH_CATEGORY_NETWORK_PROTOCOL;
 static const char *HASH_NAME      = "SNMPv3 HMAC-SHA384-256";
 static const u64   KERN_TYPE      = 26900;
+static const bool  LENGTH_SORT    = true;
 static const u32   OPTI_TYPE      = OPTI_TYPE_ZERO_BYTE
                                   | OPTI_TYPE_REGISTER_LIMIT
                                   | OPTI_TYPE_USES_BITS_64;
@@ -41,6 +42,7 @@ u32         module_dgst_size      (MAYBE_UNUSED const hashconfig_t *hashconfig, 
 u32         module_hash_category  (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return HASH_CATEGORY;   }
 const char *module_hash_name      (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return HASH_NAME;       }
 u64         module_kern_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return KERN_TYPE;       }
+bool        module_length_sort    (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return LENGTH_SORT;     }
 u32         module_opti_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return OPTI_TYPE;       }
 u64         module_opts_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return OPTS_TYPE;       }
 u32         module_salt_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return SALT_TYPE;       }
@@ -50,7 +52,7 @@ const char *module_st_pass        (MAYBE_UNUSED const hashconfig_t *hashconfig, 
 static const char *SIGNATURE_SNMPV3 = "$SNMPv3$5$";
 
 #define SNMPV3_SALT_MAX             1500
-#define SNMPV3_ENGINEID_MAX         34
+#define SNMPV3_ENGINEID_MAX         64
 #define SNMPV3_MSG_AUTH_PARAMS_LEN  32
 #define SNMPV3_ROUNDS               1048576
 #define SNMPV3_MAX_PW_LENGTH        128
@@ -59,7 +61,7 @@ static const char *SIGNATURE_SNMPV3 = "$SNMPv3$5$";
 #define SNMPV3_HASH_ELEMS           8
 
 #define SNMPV3_MAX_SALT_ELEMS       512 // 512 * 4 = 2048 > 1500, also has to be multiple of SNMPV3_MAX_PW_LENGTH
-#define SNMPV3_MAX_ENGINE_ELEMS     32  // 32 * 4 = 128 > 34, also has to be multiple of SNMPV3_MAX_PW_LENGTH
+#define SNMPV3_MAX_ENGINE_ELEMS     32  // 32 * 4 = 128 > 64, also has to be multiple of SNMPV3_MAX_PW_LENGTH
 #define SNMPV3_MAX_PNUM_ELEMS       4   // 4 * 4 = 16 > 9
 
 typedef struct hmac_sha384_tmp
@@ -264,6 +266,19 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   // use the real decoded length so engine IDs != 17 bytes localize correctly
   snmpv3->engineID_len = hex_decode (engineID_pos, engineID_len, engineID_ptr);
 
+  // RFC 3411 forbids an engine id of all zeros and one of all 0xff
+
+  u8 acc_or  = 0;
+  u8 acc_and = 0xff;
+
+  for (u32 i = 0; i < snmpv3->engineID_len; i++)
+  {
+    acc_or  |= engineID_ptr[i];
+    acc_and &= engineID_ptr[i];
+  }
+
+  if ((acc_or == 0) || (acc_and == 0xff)) return (PARSER_SALT_VALUE);
+
   // digest
 
   const u8 *hash_pos = token.buf[4];
@@ -297,23 +312,7 @@ int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
   out_len++;
 
-  // remove zero padding from snmpv3->engineID_buf
-
-  const u8 *engineID_buf_tmp = (const u8 *) snmpv3->engineID_buf;
-
-  u32 engineID_len = snmpv3->engineID_len;
-
-  // engineID_buf is zeroed and only engineID_len bytes are written into it, so the byte at
-  // engineID_len is always zero and the walk always takes at least one step. An engine ID that is
-  // all zero bytes walks the unsigned index below zero and reads 4 GB past the esalt.
-
-  while ((engineID_len > 0) && (engineID_buf_tmp[engineID_len] == 0x00)) engineID_len--;
-
-  engineID_len++;
-
-  // append to output
-
-  out_len += hex_encode ((const u8 *) snmpv3->engineID_buf, engineID_len, out_buf + out_len);
+  out_len += hex_encode ((const u8 *) snmpv3->engineID_buf, snmpv3->engineID_len, out_buf + out_len);
 
   out_buf[out_len] = '$';
 
@@ -348,6 +347,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_benchmark_mask           = MODULE_DEFAULT;
   module_ctx->module_benchmark_charset        = MODULE_DEFAULT;
   module_ctx->module_benchmark_salt           = MODULE_DEFAULT;
+  module_ctx->module_benchmark_cost           = MODULE_DEFAULT;
   module_ctx->module_bridge_name              = MODULE_DEFAULT;
   module_ctx->module_bridge_type              = MODULE_DEFAULT;
   module_ctx->module_build_plain_postprocess  = MODULE_DEFAULT;
@@ -373,10 +373,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_status       = MODULE_DEFAULT;
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
+  module_ctx->module_hash_hints               = MODULE_DEFAULT;
   module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
+  module_ctx->module_hash_recipe              = MODULE_DEFAULT;
   module_ctx->module_hashes_count_min         = MODULE_DEFAULT;
   module_ctx->module_hashes_count_max         = MODULE_DEFAULT;
   module_ctx->module_hlfmt_disable            = MODULE_DEFAULT;
@@ -395,8 +397,10 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_kernel_loops_min         = module_kernel_loops_min;
   module_ctx->module_kernel_threads_max       = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_min       = MODULE_DEFAULT;
+  module_ctx->module_kern_bits                = MODULE_DEFAULT;
   module_ctx->module_kern_type                = module_kern_type;
   module_ctx->module_kern_type_dynamic        = MODULE_DEFAULT;
+  module_ctx->module_length_sort              = module_length_sort;
   module_ctx->module_opti_type                = module_opti_type;
   module_ctx->module_opts_type                = module_opts_type;
   module_ctx->module_outfile_check_disable    = MODULE_DEFAULT;
@@ -407,6 +411,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_pwdump_column            = MODULE_DEFAULT;
   module_ctx->module_pw_max                   = MODULE_DEFAULT;
   module_ctx->module_pw_min                   = module_pw_min;
+  module_ctx->module_register_options         = MODULE_DEFAULT;
   module_ctx->module_salt_max                 = MODULE_DEFAULT;
   module_ctx->module_salt_min                 = MODULE_DEFAULT;
   module_ctx->module_salt_type                = module_salt_type;

@@ -48,7 +48,7 @@ trap 'rm -rf "$stage_root"' EXIT
 
 mkdir -p "$stage"
 
-for directory in bridges charsets docs extra feeds layouts masks modules OpenCL pcfg rules tunings; do
+for directory in bridges charsets docs extra feeds tables masks modules OpenCL pcfg rules tunings; do
   if [ ! -d "$directory" ]; then
     echo "! required release directory is missing: $directory"
     exit 1
@@ -57,7 +57,7 @@ for directory in bridges charsets docs extra feeds layouts masks modules OpenCL 
   cp -R "$directory" "$stage/"
 done
 
-for file in hashcat.hcstat2 example.dict; do
+for file in README.md hashcat.hcstat2 example.dict; do
   if [ ! -f "$file" ]; then
     echo "! required release file is missing: $file"
     exit 1

@@ -23,15 +23,14 @@ static const size_t SAMPLE_SIZE = 65536;
 
 #define SEEKDB_FRAME_GEN 2
 
-// Which process is writing, so that two of them sharing a seek database directory do not pick the
-// same temporary name.
+// lseek (), for reporting how far through a compressed source the walk has got. Which process is
+// writing used to be worked out here as well; hc_tmp_tag () in src/shared.c answers that now, and
+// answers it for other machines too.
 
 #if defined (_WIN)
-#include <process.h>
-#define SEEKDB_GETPID _getpid
+#include <io.h>
 #else
 #include <unistd.h>
-#define SEEKDB_GETPID getpid
 #endif
 
 // How many bytes a compressed wordlist has to decode to before hashcat says anything about it not
@@ -394,7 +393,7 @@ static bool seekdb_save (const char *path, const char *wordlist, const u64 line_
 
   char tmp[HCBUFSIZ_SMALL];
 
-  const int tmp_len = snprintf (tmp, sizeof (tmp), "%s.tmp.%d", path, (int) SEEKDB_GETPID ());
+  const int tmp_len = snprintf (tmp, sizeof (tmp), "%s.tmp.%016" PRIx64, path, hc_tmp_tag ());
 
   if (tmp_len < 0) return false;
   if (tmp_len >= (int) sizeof (tmp)) return false;
@@ -818,6 +817,21 @@ static u64 *seekdb_build (feed_thread_t *feed_thread, const char *seekdb_path, c
 
   double prev_percent = 0;
 
+  // A plain wordlist arrives as one window: the loop below walks the whole mmap in a single pass, so
+  // the report at the bottom of it is reached once, after the counting has already finished. On a
+  // hundred gigabytes that is minutes with nothing on the screen, which is the wait this exists to
+  // fill. Reported from inside the scan instead, every say_step bytes of the file.
+  //
+  // A compressed source is not read this way. It arrives a window at a time and is reported at the
+  // bottom of the loop, where how far into the compressed bytes it has reached is the only total
+  // there is to measure it against.
+
+  const u64 say_step = (feed_thread->file_size / 200) + 1;
+
+  u64 say_next = say_step;
+
+  double say_last = 0;
+
   bool done = false;
 
   while (done == false)
@@ -889,6 +903,35 @@ static u64 *seekdb_build (feed_thread_t *feed_thread, const char *seekdb_path, c
         }
 
         tmp[checkpoints++] = pos;
+
+        // Two throttles, because either on its own is wrong. The byte one decides how often the clock
+        // is worth asking, and moves on whether anything is said or not, so a file read at a gigabyte
+        // a second costs 200 clock reads rather than one per line. The clock one decides whether to
+        // say anything, so a fast file is redrawn at most twice a second and a slow one still
+        // reports while it works. Nothing is said for the first 500 milliseconds, so a wordlist
+        // counted in an instant is counted in silence.
+
+        if (pos >= say_next)
+        {
+          say_next = pos + say_step;
+
+          const double msec = hc_timer_get (start);
+
+          if ((msec - say_last) >= 500.0)
+          {
+            say_last = msec;
+
+            cache_generate_t cache_generate;
+
+            cache_generate.dictfile = wordlist;
+            cache_generate.comp     = pos;
+            cache_generate.percent  = ((double) pos / (double) feed_thread->file_size) * 100;
+            cache_generate.cnt      = lines;
+            cache_generate.runtime  = msec;
+
+            EVENT_DATA (EVENT_WORDLIST_CACHE_GENERATE, &cache_generate, sizeof (cache_generate));
+          }
+        }
       }
 
       // All that the tail below wants from the walk is whether the file ends on a line ending, so that
@@ -991,7 +1034,6 @@ static u64 *seekdb_build (feed_thread_t *feed_thread, const char *seekdb_path, c
       cache_generate.comp        = cur_pos;
       cache_generate.percent     = percent;
       cache_generate.cnt         = lines;
-      cache_generate.cnt2        = lines;
       cache_generate.runtime     = hc_timer_get (start);
 
       EVENT_DATA (EVENT_WORDLIST_CACHE_GENERATE, &cache_generate, sizeof (cache_generate));

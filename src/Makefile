@@ -27,8 +27,8 @@
 ##
 
 DEBUG                   := 0
-PRODUCTION              := 0
-PRODUCTION_VERSION      := v7.1.2
+PRODUCTION              := 1
+PRODUCTION_VERSION      := v8.0.0
 MACOS_UNIVERSAL_BINARY  ?= 0
 ENABLE_LTO              ?= 0
 ENABLE_CUBIN            ?= 1
@@ -188,9 +188,9 @@ endif
 ## Do not modify
 ##
 
-MODULE_INTERFACE_VERSION := 720
-BRIDGE_INTERFACE_VERSION := 720
-FEEDS_INTERFACE_VERSION  := 720
+MODULE_INTERFACE_VERSION := 800
+BRIDGE_INTERFACE_VERSION := 800
+FEEDS_INTERFACE_VERSION  := 800
 
 ##
 ## Toolchains
@@ -256,9 +256,6 @@ WINDRES_WIN             := x86_64-w64-mingw32-windres
 CXX_WIN                 := x86_64-w64-mingw32-g++
 AR_WIN                  := x86_64-w64-mingw32-ar
 
-# See BUILD_WSL.md to make this
-WIN_PYTHON              := /opt/win-python
-
 endif
 
 CC_NATIVE_CLANG         := 0
@@ -308,13 +305,13 @@ ifeq ($(PRODUCTION),1)
 VERSION_TAG             := $(PRODUCTION_VERSION)
 else
 VERSION_TAG             := $(shell git describe --tags --dirty=+ || echo $(PRODUCTION_VERSION))
+endif # PRODUCTION
 
 # A Windows version resource is four numbers. VERSION_TAG is a git description, so the release is
 # taken from the front of it and the commit count becomes the fourth field. Both forms work:
 # v7.1.2 gives 7,1,2,0 and v7.1.2-40-gabc1234 gives 7,1,2,40.
 
 VERSION_NUM             := $(shell echo "$(VERSION_TAG)" | sed -e 's/^v//' -e 's/+$$//' -e 's/-g[0-9a-f]*$$//' -e 's/-/./' | awk -F. '{printf "%d,%d,%d,%d", $$1+0, $$2+0, $$3+0, $$4+0}')
-endif # PRODUCTION
 
 VERSION_PURE            := $(shell echo "$(VERSION_TAG)" | $(SED) 's/.*v\([\.0-9]*\).*/\1/')
 VERSION_MAJOR           := $(firstword $(subst ., ,$(VERSION_PURE)))
@@ -384,13 +381,20 @@ ifeq ($(UNAME),CYGWIN)
 HASHCAT_FRONTEND        := hashcat.exe
 HASHCAT_LIBRARY_NATIVE  := hashcat.dll
 RESOURCE_NATIVE         := obj/hashcat.res.NATIVE.o
+LIBRARY_RESOURCE_NATIVE := obj/hashcat_lib.res.NATIVE.o
+PLUGIN_RESOURCE_NATIVE  := obj/hashcat_plugin.res.NATIVE.o
 endif # CYGWIN
 
 ifeq ($(UNAME),MSYS2)
 HASHCAT_FRONTEND        := hashcat.exe
 HASHCAT_LIBRARY_NATIVE  := hashcat.dll
 RESOURCE_NATIVE         := obj/hashcat.res.NATIVE.o
+LIBRARY_RESOURCE_NATIVE := obj/hashcat_lib.res.NATIVE.o
+PLUGIN_RESOURCE_NATIVE  := obj/hashcat_plugin.res.NATIVE.o
 endif # MSYS2
+
+LIBRARY_RESOURCE_WIN    := obj/hashcat_lib.res.WIN.o
+PLUGIN_RESOURCE_WIN     := obj/hashcat_plugin.res.WIN.o
 
 # make install and make uninstall run on this machine and touch nothing a cross build wrote
 
@@ -455,6 +459,28 @@ ifeq ($(HAVE_MCPU_NATIVE),1)
 MCPU_NATIVE             := -mcpu=native -mtune=native
 endif
 
+# MCPU names the core to build for, for a build that has to run on a machine other than this one.
+# It replaces the native flags rather than joining them, which is the whole point: -march=native is
+# this machine's architecture, and a binary built for a newer architecture and merely tuned for an
+# older core faults on the older one. On its own -mcpu carries the right architecture with it, so
+# naming the core is all it takes: cortex-a53 and cortex-a72 bring armv8-a, cortex-a76 armv8.2-a.
+
+# The probe wants a clean run and not only a zero exit, because -mcpu is not an x86 flag and gcc
+# there takes it as a deprecated spelling of -mtune, says so on stderr, and exits 0 anyway. Taking
+# that would swap -march=native for a tuning flag and lose the architecture, which is the fault this
+# variable exists to avoid. clang on x86 refuses the flag outright and needs no help.
+
+ifneq ($(MCPU),)
+MCPU_PROBE              := $(shell echo | $(CC_NATIVE) -mcpu=$(MCPU) -E - 2>&1 >/dev/null)
+HAVE_MCPU               := $(if $(MCPU_PROBE),0,1)
+
+ifeq ($(HAVE_MCPU),0)
+$(error MCPU=$(MCPU) is not a core $(CC_NATIVE) builds for with -mcpu)
+endif
+
+CFLAGS_HOST_ONLY        += -mcpu=$(MCPU)
+else
+
 ifeq ($(UNAME),Darwin)
 # a universal binary is built for two architectures at once, so it cannot be built for this one
 ifeq ($(MACOS_UNIVERSAL_BINARY),0)
@@ -468,12 +494,70 @@ CFLAGS_HOST_ONLY        += $(MARCH_NATIVE)
 endif
 endif
 
+endif
+
 ifeq ($(UNAME),Linux)
-IS_RPI                  := $(shell grep -q Raspberry /proc/cpuinfo && echo 1 || echo 0)
+
+IS_RPI                  := $(shell grep -q Raspberry /proc/cpuinfo 2>/dev/null && echo 1 || echo 0)
 
 ifeq ($(IS_RPI),1)
-CFLAGS_HOST_ONLY        += -mcpu=cortex-a72
+
+# What -march=native leaves out on a Raspberry Pi. It resolves the architecture, and on a Pi 4 that is
+# armv8-a, but it leaves the scheduling model at "generic", and -mtune=native does not name the core
+# either. -mcpu does, and this is where the old -mcpu=cortex-a72 came from.
+#
+# Which core, though, is read from the "CPU part" line of /proc/cpuinfo rather than assumed. The board
+# name says Raspberry Pi for machines whose cores are three generations apart, a Cortex-A53 on a Pi 3,
+# an A72 on a Pi 4 and an A76 on a Pi 5, so a single hardcoded name tunes two of the three for the
+# wrong machine.
+#
+# The test stays inside the Raspberry Pi branch on purpose. Every other aarch64 machine keeps the
+# flags it has today, because naming a core for hardware nobody asked about would be a change to
+# machines this is not about.
+#
+# -mcpu=native would answer the same question in one flag and is not used, because on a Pi 4 with
+# clang 19 it answers it wrongly: it adds +aes and +sha2, which the BCM2711 does not have, and a
+# binary that uses them dies with SIGILL on the machine that compiled it. /proc/cpuinfo there lists
+# "fp asimd evtstrm crc32 cpuid" and no crypto.
+#
+# Only when every core reports the same part, because a name taken from one half of a big.LITTLE pair
+# tunes for a core that half the threads never run on. And only when the compiler accepts the name,
+# which also drops the 32 bit cores of the older boards, since a 64 bit build cannot target them.
+
+CPU_PARTS               := $(shell awk '/^CPU part/ { print $$4 }' /proc/cpuinfo 2>/dev/null | sort -u)
+
+MCPU_PART_0xd03         := cortex-a53
+MCPU_PART_0xd07         := cortex-a57
+MCPU_PART_0xd08         := cortex-a72
+MCPU_PART_0xd0b         := cortex-a76
+
+ifeq ($(MCPU),)
+ifeq ($(words $(CPU_PARTS)),1)
+MCPU_TUNE               := $(MCPU_PART_$(CPU_PARTS))
+
+# The list covers every 64 bit Raspberry Pi there is, so a part it does not know is a board newer than
+# this file. The build still works, because -march=native already got the architecture right and only
+# the scheduling model is missing, so this says so rather than stopping.
+
+ifeq ($(MCPU_TUNE),)
+$(warning Raspberry Pi with CPU part $(CPU_PARTS), which this Makefile has no -mcpu name for)
+$(warning building without it, which costs scheduling only; add MCPU_PART_$(CPU_PARTS) or pass MCPU=)
 endif
+
+endif
+endif
+
+ifneq ($(MCPU_TUNE),)
+MCPU_TUNE_PROBE         := $(shell echo | $(CC_NATIVE) -mcpu=$(MCPU_TUNE) -E - 2>&1 >/dev/null)
+HAVE_MCPU_TUNE          := $(if $(MCPU_TUNE_PROBE),0,1)
+
+ifeq ($(HAVE_MCPU_TUNE),1)
+CFLAGS_HOST_ONLY        += -mcpu=$(MCPU_TUNE)
+endif
+endif
+
+endif
+
 endif
 endif
 
@@ -515,10 +599,24 @@ CFLAGS                  += -DDEBUG -Og -ggdb
 else
 CFLAGS                  += -DDEBUG -O0 -ggdb
 endif
-CFLAGS                  += -fsanitize=address -fno-omit-frame-pointer
-# ASan must reach the link too, otherwise every target fails with undefined
-# __asan_* references. CFLAGS alone is not enough for the shared-library layout.
-LFLAGS                  += -fsanitize=address
+# Which sanitizers DEBUG=2 turns on. Defaults to AddressSanitizer, which is
+# what DEBUG=2 has always meant. Override to add or swap, e.g.
+#   make DEBUG=2 SANITIZE=address,undefined
+#   make DEBUG=2 SANITIZE=undefined
+# ASan and MSan are mutually exclusive; UBSan combines with either.
+SANITIZE                ?= address
+CFLAGS                  += -fsanitize=$(SANITIZE) -fno-omit-frame-pointer
+# Deliberately NOT -fno-sanitize-recover=undefined. Making UBSan fatal at the
+# first finding aborts the process before later, unrelated checks run: a UBSan
+# hit during startup (src/path.c) killed hashcat before hashes_init_stage1 and
+# hid a real ASan stack-use-after-scope in a module parser. Let UBSan report and
+# continue, and leave abort-on-first as a runtime choice via
+# UBSAN_OPTIONS=halt_on_error=1 when that is what you actually want.
+# The sanitizer must reach the link too, otherwise every target that links the
+# C++ deps (deps/unrar) fails with undefined __asan_* references. CFLAGS is not
+# enough for the shared-library layout: libhashcat.so.8, the module plugins and
+# the feed plugins are all separate link steps.
+LFLAGS                  += -fsanitize=$(SANITIZE)
 endif
 endif
 endif
@@ -651,20 +749,29 @@ CFLAGS_NATIVE           += -DSSE2NEON_SUPPRESS_WARNINGS
 CFLAGS_NATIVE           += -I$(DEPS_SSE2NEON)
 endif
 
+## Windows gives every thread the stack size the executable header asks for, 2 MiB by default, where
+## Linux gives 8 MiB. hiprtc compiles a kernel on the calling thread, and the Whirlpool and Streebog
+## kernels need more than 2 MiB there, so they died with a stack overflow under HIP on Windows only.
+
+LFLAGS_WIN_STACK        := -Wl,--stack,0x800000
+
 ifeq ($(UNAME),CYGWIN)
 CFLAGS_NATIVE           := $(CFLAGS)
 CFLAGS_NATIVE           += -DWITH_HWMON
 LFLAGS_NATIVE           := $(LFLAGS)
 LFLAGS_NATIVE           += -lpsapi
+LFLAGS_NATIVE           += $(LFLAGS_WIN_STACK)
 endif # CYGWIN
 
 ifeq ($(UNAME),MSYS2)
 CFLAGS_NATIVE           := $(CFLAGS)
 CFLAGS_NATIVE           += -DWITH_HWMON
+CFLAGS_NATIVE           += -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
 LFLAGS_NATIVE           := $(LFLAGS)
 LFLAGS_NATIVE           += -lpsapi
 LFLAGS_NATIVE           += -lws2_32
 LFLAGS_NATIVE           += -lpowrprof
+LFLAGS_NATIVE           += $(LFLAGS_WIN_STACK)
 
 # Every library that is not part of Windows goes INTO the binary that needs it, because no runtime
 # DLL is shipped beside these binaries and the working directory is no longer searched for one. A
@@ -740,6 +847,7 @@ endif
 CFLAGS_WIN              := $(filter-out $(CFLAGS_HOST_ONLY),$(CFLAGS))
 CFLAGS_WIN              += -fPIC
 CFLAGS_WIN              += -DWITH_HWMON
+CFLAGS_WIN              += -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
 
 # clang is one compiler for every target and has to be told which one it is building for. A cross gcc
 # is a compiler for a single target and needs nothing said. The flag is kept in a variable of its own
@@ -793,11 +901,11 @@ ifeq ($(CC_WIN_CLANG),0)
 LFLAGS_WIN              += -static-libstdc++
 endif
 LFLAGS_WIN              += -lole32 -loleaut32 -lwbemuuid
+LFLAGS_WIN              += $(LFLAGS_WIN_STACK)
 
 ifeq ($(ENABLE_LTO),1)
 ifeq ($(CC_WIN_CLANG),1)
 LFLAGS_WIN              += -fuse-ld=lld
-LFLAGS_WIN              += -Wl,--stack,0x200000
 endif
 endif
 
@@ -1042,6 +1150,12 @@ ifeq ($(MAINTAINER_MODE),0)
 SIMD_LINUX              := -mavx2
 SIMD_WIN                := -mavx2
 
+ifneq ($(MCPU),)
+# the same core the frontend is built for, or the three bridges below would be the one part of the
+# artifact still built for the machine that compiled it
+SIMD_NATIVE             := -mcpu=$(MCPU)
+else
+
 ifeq ($(UNAME),Darwin)
 ifeq ($(IS_APPLE_SILICON),0)
 SIMD_NATIVE             := -mavx2
@@ -1052,6 +1166,8 @@ SIMD_NATIVE             := $(MCPU_NATIVE)
 else
 SIMD_NATIVE             := $(MARCH_NATIVE)
 endif
+endif
+
 endif
 endif
 
@@ -1130,11 +1246,17 @@ endif
 
 EMU_OBJS_ALL            := emu_general emu_inc_common emu_inc_platform emu_inc_scalar emu_inc_simd
 EMU_OBJS_ALL            += emu_inc_rp_common emu_inc_rp emu_inc_rp_optimized
-EMU_OBJS_ALL            += emu_inc_hash_md4 emu_inc_hash_md5 emu_inc_hash_ripemd160 emu_inc_hash_sha1 emu_inc_hash_sha256 emu_inc_hash_sha384 emu_inc_hash_sha512 emu_inc_hash_streebog256 emu_inc_hash_streebog512 emu_inc_ecc_secp256k1 emu_inc_bignum_operations
+EMU_OBJS_ALL            += emu_inc_hash_md4 emu_inc_hash_md5 emu_inc_hash_ripemd160 emu_inc_hash_sha1 emu_inc_hash_sha256 emu_inc_hash_sha384 emu_inc_hash_sha512 emu_inc_hash_streebog256 emu_inc_hash_streebog512 emu_inc_ecc_secp256k1 emu_inc_bignum_2048
+EMU_OBJS_ALL            += emu_inc_hash_blake2b emu_inc_hash_blake2s emu_inc_hash_sm3 emu_inc_hash_whirlpool emu_inc_hash_sha3 emu_inc_hash_gost94 emu_inc_hash_ripemd320 emu_inc_hash_mysql323 emu_inc_hash_haval emu_inc_hash_tiger emu_inc_hash_ripemd128 emu_inc_hash_ripemd256 emu_inc_hash_md2 emu_inc_hash_sha0 emu_inc_hash_snefru emu_inc_hash_skein512 emu_inc_hash_panama emu_inc_hash_lm emu_inc_hash_mdc2
+EMU_OBJS_ALL            += emu_inc_hash_blake emu_inc_hash_bmw emu_inc_hash_cubehash emu_inc_hash_echo emu_inc_hash_fugue emu_inc_hash_groestl emu_inc_hash_hamsi emu_inc_hash_jh emu_inc_hash_luffa emu_inc_hash_shabal emu_inc_hash_shavite emu_inc_hash_simd
+EMU_OBJS_ALL            += emu_inc_hash_has160 emu_inc_hash_edonr emu_inc_hash_md6 emu_inc_hash_radiogatun emu_inc_hash_ripemd emu_inc_hash_whirlpool01
 EMU_OBJS_ALL            += emu_inc_cipher_aes emu_inc_cipher_camellia emu_inc_cipher_des emu_inc_cipher_kuznyechik emu_inc_cipher_serpent emu_inc_cipher_twofish
 EMU_OBJS_ALL            += emu_inc_hash_base58
 
-OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface keyboard_layout locking logfile loopback memchr memory monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe restore rp rp_cpu selftest slow_candidates shared status stdout straight generic system terminal thread timer tuningdb usage user_options wordlist $(EMU_OBJS_ALL)
+# the escape's walk over the packed pool, so the host reports what the device matched from one source
+EMU_OBJS_ALL            += emu_inc_pcfg emu_inc_pcfg_omen
+
+OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface json keyboard_layout locking logfile loopback memchr memory module_options module_options_cache module_options_value monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe recipe restore rp rp_cpu selftest slow_candidates shared status status_rc stdout straight generic system terminal thread timer tuningdb usage user_options user_options_table wordlist $(EMU_OBJS_ALL)
 
 ifeq ($(ENABLE_BRAIN),1)
 OBJS_ALL                += brain
@@ -1303,12 +1425,17 @@ obj/api.c: $(API_HEADER_ROOTS)
 ## old number for, which is the refusal a stale plugin is supposed to meet not happening. None of
 ## them says a word.
 ##
+## The folders belong to it as well. The frontend is compiled with them and the frontend and plugins
+## carry LIBRARY_FOLDER in their rpath, so a make install with another PREFIX than the build used
+## installed a frontend that looks for its files where the build meant to put them.
+##
 ## So the answer is written down. The file is rewritten only when the answer actually differs, so its
 ## timestamp is the moment the arrangement last changed, and naming it as a prerequisite is what
 ## makes a switch rebuild what the switch decides, objects included.
 ##
 
 ARRANGEMENT             := SHARED=$(SHARED) PLUGIN_ABI=$(MODULE_INTERFACE_VERSION) PLUGINS=$(PLUGIN_PLATFORM_so)
+ARRANGEMENT             += INSTALL_FOLDER=$(INSTALL_FOLDER) SHARED_FOLDER=$(SHARED_FOLDER) DOCUMENT_FOLDER=$(DOCUMENT_FOLDER) LIBRARY_FOLDER=$(LIBRARY_FOLDER)
 
 .PHONY: FORCE
 FORCE:
@@ -1430,8 +1557,8 @@ LIBRARY_LFLAGS_WIN      += $(TARGET_WIN)
 
 define LIBRARY_RULES
 
-$$(HASHCAT_LIBRARY_$(1)): $$(CORE_OBJS_$(1)) obj/arrangement
-	$$(CC_$(1)) $$(CORE_OBJS_$(1)) -o $$@ $$(LFLAGS_$(1)) $$(LIBRARY_LFLAGS_$(1))
+$$(HASHCAT_LIBRARY_$(1)): $$(CORE_OBJS_$(1)) $$(LIBRARY_RESOURCE_$(1)) obj/arrangement
+	$$(CC_$(1)) $$(CORE_OBJS_$(1)) $$(LIBRARY_RESOURCE_$(1)) -o $$@ $$(LFLAGS_$(1)) $$(LIBRARY_LFLAGS_$(1))
 
 endef
 
@@ -1471,6 +1598,17 @@ obj/hashcat.res.WIN.o: src/hashcat.rc src/hashcat.manifest obj/arrangement
 obj/hashcat.res.NATIVE.o: src/hashcat.rc src/hashcat.manifest obj/arrangement
 	$(call resource_compile,NATIVE)
 
+## src/hashcat_dll.rc is the same version block for hashcat.dll and for every plugin DLL. One object
+## serves all the plugins, so it names no file.
+
+resource_dll_compile = $(WINDRES_$(1)) -I src -DHC_VERSION_NUM=$(VERSION_NUM) -DHC_VERSION_STR='\"$(VERSION_TAG)\"' $(2) src/hashcat_dll.rc -o $@
+
+obj/hashcat_lib.res.%.o: src/hashcat_dll.rc obj/arrangement
+	$(call resource_dll_compile,$*,-DHC_RC_LIBRARY)
+
+obj/hashcat_plugin.res.%.o: src/hashcat_dll.rc obj/arrangement
+	$(call resource_dll_compile,$*,)
+
 # A native build is a Windows one on MSYS2 and CYGWIN, and those get the resource section too. On
 # every other platform RESOURCE_NATIVE is empty and the link is unchanged.
 
@@ -1494,17 +1632,17 @@ $(HASHCAT_FRONTEND): src/main.c $(CORE_NATIVE) $(RESOURCE_NATIVE) obj/arrangemen
 ## $(call) cuts its arguments at every comma and a flag is allowed to contain one. Those flags come
 ## last, so a plugin cannot put its own include path in front of the tree's.
 
-plugin_link = $(CC_$(1)) $(CCFLAGS) $(CFLAGS_PLUGIN_$(1)) $(CFLAGS_ABI) $(if $(3),$(DEPFLAGS) -MF $(3)) $(2) $(CORE_$(1)) -o $@ $(LFLAGS_$(1)) $(if $(filter $(1),$(SHARED_PLATFORMS)),$(LFLAGS_PLUGIN_$(1))) -shared -fPIC -D $(4) $($(5))
+plugin_link = $(CC_$(1)) $(CCFLAGS) $(CFLAGS_PLUGIN_$(1)) $(CFLAGS_ABI) $(if $(3),$(DEPFLAGS) -MF $(3)) $(2) $(PLUGIN_RESOURCE_$(1)) $(CORE_$(1)) -o $@ $(LFLAGS_$(1)) $(if $(filter $(1),$(SHARED_PLATFORMS)),$(LFLAGS_PLUGIN_$(1))) -shared -fPIC -D $(4) $($(5))
 
 define PLUGIN_RULES
 
-modules/module_%.$(PLUGIN_SUFFIX_$(1)): src/modules/module_%.c $$(CORE_$(1)) obj/arrangement
+modules/module_%.$(PLUGIN_SUFFIX_$(1)): src/modules/module_%.c $$(CORE_$(1)) $$(PLUGIN_RESOURCE_$(1)) obj/arrangement
 	$$(call plugin_link,$(1),$$<,obj/module_$$*.$(1).d,MODULE_INTERFACE_VERSION_CURRENT=$$(MODULE_INTERFACE_VERSION),)
 
-feeds/feed_%.$(PLUGIN_SUFFIX_$(1)): src/feeds/feed_%.c $$(CORE_$(1)) obj/arrangement
+feeds/feed_%.$(PLUGIN_SUFFIX_$(1)): src/feeds/feed_%.c $$(CORE_$(1)) $$(PLUGIN_RESOURCE_$(1)) obj/arrangement
 	$$(call plugin_link,$(1),$$<,obj/feed_$$*.$(1).d,FEEDS_INTERFACE_VERSION_CURRENT=$$(FEEDS_INTERFACE_VERSION),)
 
-bridges/bridge_%.$(PLUGIN_SUFFIX_$(1)): src/bridges/bridge_%.c $$(CORE_$(1)) obj/arrangement
+bridges/bridge_%.$(PLUGIN_SUFFIX_$(1)): src/bridges/bridge_%.c $$(CORE_$(1)) $$(PLUGIN_RESOURCE_$(1)) obj/arrangement
 	$$(call plugin_link,$(1),$$<,,BRIDGE_INTERFACE_VERSION_CURRENT=$$(BRIDGE_INTERFACE_VERSION),)
 
 MODULES_LIB_$(1)        := $$(patsubst src/modules/module_%.c,modules/module_%.$(PLUGIN_SUFFIX_$(1)),$$(MODULES_SRC))
@@ -1528,7 +1666,7 @@ define BRIDGE_RULES
 
 BRIDGE_FLAGS_$(2)_$(1)  := $(BRIDGE_CFLAGS_$(2)) $(BRIDGE_CFLAGS_$(2)_$(1))
 
-bridges/$(2).$(PLUGIN_SUFFIX_$(1)): $$(BRIDGE_SRC_$(2)) $$(CORE_$(1)) obj/arrangement $(BRIDGE_DEPS_$(2)_$(1))
+bridges/$(2).$(PLUGIN_SUFFIX_$(1)): $$(BRIDGE_SRC_$(2)) $$(CORE_$(1)) $$(PLUGIN_RESOURCE_$(1)) obj/arrangement $(BRIDGE_DEPS_$(2)_$(1))
 	$$(call plugin_link,$(1),$$(BRIDGE_SRC_$(2)),,BRIDGE_INTERFACE_VERSION_CURRENT=$$(BRIDGE_INTERFACE_VERSION),BRIDGE_FLAGS_$(2)_$(1))
 
 endef
@@ -1540,8 +1678,13 @@ $(foreach P,$(PLUGIN_PLATFORMS),$(foreach B,$(BRIDGES_ALL), \
 ## Targets: native compilation
 ##
 
+# The rows every module registers are kept in cache/module_options.<suffix>.cache, which a start reads
+# instead of loading every module. The binary just built writes it as the last step, and rewrites it
+# by itself whenever a module changes after that.
+
 .PHONY: default
 default: $(HASHCAT_FRONTEND) modules bridges feeds
+	./$(HASHCAT_FRONTEND) --module-cache-rebuild
 
 # The version this build stamps into the binary. tools/package_bin.sh asks for it so an archive is
 # named after what it holds, rather than the release number being written out a second time where it
@@ -1617,6 +1760,11 @@ distclean: clean
 
 ifneq (,$(filter LINUX,$(PLATFORMS)))
 
+# hashcat.exe can only write its module option cache where it runs. Under wine that is here, and
+# otherwise it writes the file on its first start.
+
+WIN_MODULE_CACHE        := if command -v wine > /dev/null 2>&1; then wine ./hashcat.exe --module-cache-rebuild || true; else echo "wine is not installed, so hashcat.exe writes its module option cache on its first start"; fi
+
 ifeq ($(UNAME),Darwin)
 .PHONY: binaries
 binaries: win
@@ -1626,6 +1774,7 @@ host_win:   hashcat.exe
 
 .PHONY: win
 win:   host_win   modules_win   bridges_win   feeds_win
+	@$(WIN_MODULE_CACHE)
 else
 .PHONY: binaries
 binaries: linux win
@@ -1637,6 +1786,7 @@ host_win:   hashcat.exe
 .PHONY: linux win
 linux: host_linux modules_linux bridges_linux feeds_linux
 win:   host_win   modules_win   bridges_win   feeds_win
+	@$(WIN_MODULE_CACHE)
 endif
 
 hashcat.bin: src/main.c $(CORE_LINUX) obj/arrangement
@@ -1651,13 +1801,14 @@ endif
 ## Targets: Linux install
 ##
 
-# allow (whitelist) "make install" only on unix-based systems (also disallow cygwin/msys)
+# allow (whitelist) "make install" only on unix-based systems (also disallow cygwin/msys). Android
+# means Termux, which exports PREFIX, so the install lands in its own usr tree.
 
 ifneq ($(findstring install,$(MAKECMDGOALS)),)
-  ifeq (,$(filter $(UNAME),Linux FreeBSD OpenBSD NetBSD DragonFly Darwin))
+  ifeq (,$(filter $(UNAME),Linux FreeBSD OpenBSD NetBSD DragonFly Darwin Android))
     define ERROR_INSTALL_DISALLOWED
 ! The 'install' target is not allowed on this operating system ($(UNAME)). \
-Only Linux, FreeBSD, OpenBSD, NetBSD, DragonFly and Darwin can use the 'install' target
+Only Linux, FreeBSD, OpenBSD, NetBSD, DragonFly, Darwin and Android can use the 'install' target
     endef
 
     $(error $(ERROR_INSTALL_DISALLOWED))
@@ -1666,9 +1817,9 @@ endif
 
 .PHONY: install
 ifeq ($(SHARED),1)
-install: install_docs install_shared install_tools install_library install_library_dev install_tunings install_pcfg install_kernels install_modules install_bridges install_feeds install_hashcat
+install: install_docs install_shared install_tools install_library install_library_dev install_tunings install_pcfg install_rules install_kernels install_modules install_module_cache install_bridges install_python install_feeds install_hashcat
 else
-install: install_docs install_shared install_tools                                     install_tunings install_pcfg install_kernels install_modules install_bridges install_feeds install_hashcat
+install: install_docs install_shared install_tools                                     install_tunings install_pcfg install_rules install_kernels install_modules install_module_cache install_bridges install_python install_feeds install_hashcat
 endif
 
 # we need this extra target to make sure that for parallel builds (i.e. 2+ Makefile targets could possible run at the same time)
@@ -1720,6 +1871,15 @@ install_docs: install_make_shared_root
 install_shared: install_make_shared_root
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)
 	$(INSTALL) -m 644 hashcat.hcstat2                                       $(DESTDIR)$(SHARED_FOLDER)/
+	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/extra/fpga
+	$(INSTALL) -m 644 extra/fpga/99-digilent.rules                          $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/
+	$(INSTALL) -m 644 extra/fpga/99-litepcie.rules                          $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/
+	$(INSTALL) -m 644 extra/fpga/99-ztex.rules                              $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/
+	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/zc706-sdboot
+	$(INSTALL) -m 644 extra/fpga/zc706-sdboot/README.md                     $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/zc706-sdboot/
+	$(INSTALL) -m 644 extra/fpga/zc706-sdboot/build_fsbl.tcl                $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/zc706-sdboot/
+	$(INSTALL) -m 644 extra/fpga/zc706-sdboot/fsbl.elf                      $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/zc706-sdboot/
+	$(INSTALL) -m 755 extra/fpga/zc706-sdboot/make_bootbin.py               $(DESTDIR)$(SHARED_FOLDER)/extra/fpga/zc706-sdboot/
 
 .PHONY: install_tunings
 install_tunings: install_shared
@@ -1729,10 +1889,7 @@ install_tunings: install_shared
 
 ## A ruleset ships the way tunings do, under the shared folder, because that is the one hashcat
 ## resolves at run time. A ruleset named rather than pathed on the command line is looked for in
-## here, see pcfg_resolve_root () in src/feeds/feed_pcfg.c. It is not in the document folder with
-## rules and masks, because nothing resolves that folder: -r rules/best66.rule is a relative path the
-## C library resolves against the working directory, which is why that example only works from inside
-## an unpacked tree.
+## here, see pcfg_resolve_root () in src/feeds/feed_pcfg.c.
 
 .PHONY: install_pcfg
 install_pcfg: install_shared
@@ -1740,23 +1897,56 @@ install_pcfg: install_shared
 	$(FIND) pcfg/     -mindepth 1 -type d -execdir $(INSTALL) -m 755 -d  $(DESTDIR)$(SHARED_FOLDER)/pcfg/{} \;
 	$(FIND) pcfg/     -mindepth 1 -type f -execdir $(INSTALL) -m 644 {}  $(DESTDIR)$(SHARED_FOLDER)/pcfg/{} \;
 
+## The rule lists ship under the shared folder for the same reason a ruleset does. Attack-mode 9 runs
+## a rule list by default and names it rather than pathing it, and the rules phase looks for a name it
+## cannot find beside the working directory in here. The copy under the document folder stays, because
+## that is where somebody reads them, but nothing resolves that folder: -r rules/best66.rule is a
+## relative path the C library resolves against the working directory, which is why that example only
+## works from inside an unpacked tree.
+
+.PHONY: install_rules
+install_rules: install_shared
+	$(INSTALL) -m 755 -d                                                 $(DESTDIR)$(SHARED_FOLDER)/rules
+	$(FIND) rules/    -mindepth 1 -type d -exec $(INSTALL) -m 755 -d     $(DESTDIR)$(SHARED_FOLDER)/{} \;
+	$(FIND) rules/    -mindepth 1 -type f -exec $(INSTALL) -m 644 {}     $(DESTDIR)$(SHARED_FOLDER)/{} \;
+
 .PHONY: install_kernels
 install_kernels: install_shared
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/OpenCL
 	$(FIND) OpenCL/   -mindepth 1 -type d -execdir $(INSTALL) -m 755 -d     $(DESTDIR)$(SHARED_FOLDER)/OpenCL/{} \;
 	$(FIND) OpenCL/   -mindepth 1 -type f -execdir $(INSTALL) -m 644 {}     $(DESTDIR)$(SHARED_FOLDER)/OpenCL/{} \;
 
+## The modules keep their modification times, which the module option cache installed beside them
+## identifies them by. Installed with new times, the cache is only rebuilt per user on the first start.
+
 .PHONY: install_modules
 install_modules: install_shared modules
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/modules
 	$(FIND) modules/  -mindepth 1 -type d -execdir $(INSTALL) -m 755 -d     $(DESTDIR)$(SHARED_FOLDER)/modules/{} \;
-	$(FIND) modules/  -mindepth 1 -type f -execdir $(INSTALL) -m 644 {}     $(DESTDIR)$(SHARED_FOLDER)/modules/{} \;
+	$(FIND) modules/  -mindepth 1 -type f -execdir $(INSTALL) -p -m 644 {}  $(DESTDIR)$(SHARED_FOLDER)/modules/{} \;
+
+.PHONY: install_module_cache
+install_module_cache: install_shared $(HASHCAT_FRONTEND) modules
+	./$(HASHCAT_FRONTEND) --module-cache-rebuild
+	$(INSTALL) -m 644 cache/module_options.$(PLUGIN_SUFFIX_NATIVE).cache   $(DESTDIR)$(SHARED_FOLDER)/
+
+## The Python bridge starts Python/hcworker.py from the shared folder, and Python/generic_hash.py is the
+## plugin it loads when --bridge-parameter1 names none.
+
+.PHONY: install_python
+install_python: install_shared
+	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/Python
+	$(FIND) Python/   -mindepth 1 -type f -name '*.py' -execdir $(INSTALL) -m 644 {} $(DESTDIR)$(SHARED_FOLDER)/Python/{} \;
+
+## bridges/subs holds the Rust crates the generic_hash bridge loads, and rules/ holds hybrid/, so both
+## walk with -exec rather than -execdir. -execdir passes the recipe ./basename, which installs a file
+## from a subdirectory into the parent and leaves the subdirectory empty.
 
 .PHONY: install_bridges
 install_bridges: install_shared bridges
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(SHARED_FOLDER)/bridges
-	$(FIND) bridges/  -mindepth 1 -type d -execdir $(INSTALL) -m 755 -d     $(DESTDIR)$(SHARED_FOLDER)/bridges/{} \;
-	$(FIND) bridges/  -mindepth 1 -type f -execdir $(INSTALL) -m 644 {}     $(DESTDIR)$(SHARED_FOLDER)/bridges/{} \;
+	$(FIND) bridges/  -mindepth 1 -type d -exec $(INSTALL) -m 755 -d        $(DESTDIR)$(SHARED_FOLDER)/{} \;
+	$(FIND) bridges/  -mindepth 1 -type f -exec $(INSTALL) -m 644 {}        $(DESTDIR)$(SHARED_FOLDER)/{} \;
 
 .PHONY: install_feeds
 install_feeds: install_shared feeds
@@ -1770,7 +1960,7 @@ install_library: $(HASHCAT_LIBRARY)
 	$(INSTALL) -m 755 $(HASHCAT_LIBRARY)                                    $(DESTDIR)$(LIBRARY_FOLDER)/
 
 .PHONY: install_library_dev
-install_library_dev: install_make_library_dev_root obj/api.c
+install_library_dev: install_library install_make_library_dev_root obj/api.c
 	$(INSTALL) -m 755 -d                                                    $(DESTDIR)$(LIBRARY_DEV_FOLDER)
 	$(if $(HASHCAT_LIBRARY_DEV_$(FORMAT_NATIVE)),ln -sf $(HASHCAT_LIBRARY_NATIVE) $(DESTDIR)$(LIBRARY_FOLDER)/$(HASHCAT_LIBRARY_DEV_$(FORMAT_NATIVE)))
 	$(INSTALL) -m 644 $(API_HEADERS)                                        $(DESTDIR)$(LIBRARY_DEV_FOLDER)/

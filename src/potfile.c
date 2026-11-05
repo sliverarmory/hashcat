@@ -303,16 +303,13 @@ void potfile_write_append (hashcat_ctx_t *hashcat_ctx, const char *out_buf, cons
     return;
   }
 
-  hc_lockfile (&potfile_ctx->fp);
+  hc_lockfile_warn (hashcat_ctx, &potfile_ctx->fp, potfile_ctx->filename, &potfile_ctx->lock_warned);
 
   hc_fprintf (&potfile_ctx->fp, "%s" EOL, tmp_buf);
 
   hc_fflush (&potfile_ctx->fp);
 
-  if (hc_unlockfile (&potfile_ctx->fp))
-  {
-    event_log_error (hashcat_ctx, "%s: Failed to unlock file.", potfile_ctx->filename);
-  }
+  hc_unlockfile_warn (hashcat_ctx, &potfile_ctx->fp, potfile_ctx->filename, &potfile_ctx->lock_warned);
 }
 
 void potfile_batch_begin (hashcat_ctx_t *hashcat_ctx)
@@ -323,7 +320,7 @@ void potfile_batch_begin (hashcat_ctx_t *hashcat_ctx)
   if (potfile_ctx->enabled == false) return;
   if (hashconfig->potfile_disable == true) return;
 
-  if (potfile_ctx->batch_depth == 0) hc_lockfile (&potfile_ctx->fp);
+  if (potfile_ctx->batch_depth == 0) hc_lockfile_warn (hashcat_ctx, &potfile_ctx->fp, potfile_ctx->filename, &potfile_ctx->lock_warned);
 
   potfile_ctx->batch_depth++;
 }
@@ -344,10 +341,7 @@ void potfile_batch_end (hashcat_ctx_t *hashcat_ctx)
 
   hc_fflush (&potfile_ctx->fp);
 
-  if (hc_unlockfile (&potfile_ctx->fp))
-  {
-    event_log_error (hashcat_ctx, "%s: Failed to unlock file.", potfile_ctx->filename);
-  }
+  hc_unlockfile_warn (hashcat_ctx, &potfile_ctx->fp, potfile_ctx->filename, &potfile_ctx->lock_warned);
 }
 
 void potfile_update_hash (hashcat_ctx_t *hashcat_ctx, hash_t *found, char *line_pw_buf, int line_pw_len)
@@ -536,6 +530,19 @@ static bool potfile_prefix_build (potfile_prefix_t *prefix, const hash_t *hashes
   return true;
 }
 
+static void potfile_clear_digest_salt (hash_t *hash_buf, const hashconfig_t *hashconfig)
+{
+  memset (hash_buf->digest, 0, hashconfig->dgst_size);
+
+  if (hash_buf->salt) memset (hash_buf->salt, 0, sizeof (salt_t));
+}
+
+static void potfile_clear_salt_bufs (hash_t *hash_buf, const hashconfig_t *hashconfig)
+{
+  if (hash_buf->esalt)     memset (hash_buf->esalt,     0, hashconfig->esalt_size);
+  if (hash_buf->hook_salt) memset (hash_buf->hook_salt, 0, hashconfig->hook_salt_size);
+}
+
 int potfile_remove_parse (hashcat_ctx_t *hashcat_ctx)
 {
   const hashconfig_t  *hashconfig   = hashcat_ctx->hashconfig;
@@ -691,6 +698,17 @@ int potfile_remove_parse (hashcat_ctx_t *hashcat_ctx)
 
   char *line_buf = (char *) hcmalloc (HCBUFSIZ_LARGE);
 
+  // An esalt or a hook salt can run to megabytes (BitLocker, 7-Zip, KeePass), and clearing it for
+  // every line made a large potfile of some other hash type take hours to load. A decoder refuses such
+  // a line before it writes either buffer, so both are cleared only after a line was accepted. A line
+  // accepted on top of what a refused line left behind is decoded once more from cleared buffers, so
+  // every accepted line is still decoded from zero.
+
+  const bool has_salt_bufs = (hash_buf.esalt != NULL) || (hash_buf.hook_salt != NULL);
+
+  bool salt_bufs_dirty   = false;
+  bool salt_bufs_touched = false;
+
   while (!hc_feof (&potfile_ctx->fp))
   {
     size_t line_len = fgetl (&potfile_ctx->fp, line_buf, HCBUFSIZ_LARGE);
@@ -713,25 +731,21 @@ int potfile_remove_parse (hashcat_ctx_t *hashcat_ctx)
 
     if (line_hash_len == 0) continue;
 
-    if (hash_buf.salt)
-    {
-      memset (hash_buf.salt, 0, sizeof (salt_t));
-    }
+    // One digest buffer serves every line, so a decoder that leaves part of it alone starts from
+    // whatever the line before wrote. Only the four words at dgst_pos0 to dgst_pos3 are ever
+    // compared, and no decoder in the tree writes one of those on one line and skips it on the next,
+    // so today the bytes that survive are zero on both sides. That holds because of what the
+    // decoders happen to do and not because of anything here, which is why the salt is cleared as
+    // well.
 
-    if (hash_buf.esalt)
-    {
-      memset (hash_buf.esalt, 0, hashconfig->esalt_size);
-    }
-
-    if (hash_buf.hook_salt)
-    {
-      memset (hash_buf.hook_salt, 0, hashconfig->hook_salt_size);
-    }
+    potfile_clear_digest_salt (&hash_buf, hashconfig);
 
     if (module_ctx->module_hash_decode_potfile != MODULE_DEFAULT)
     {
       if (module_ctx->module_potfile_custom_check != MODULE_DEFAULT)
       {
+        potfile_clear_salt_bufs (&hash_buf, hashconfig);
+
         const int parser_status = module_ctx->module_hash_decode_potfile (hashconfig, hash_buf.digest, hash_buf.salt, hash_buf.esalt, hash_buf.hook_salt, hash_buf.hash_info, line_hash_buf, line_hash_len, tmps);
 
         if (parser_status != PARSER_OK) continue;
@@ -755,9 +769,29 @@ int potfile_remove_parse (hashcat_ctx_t *hashcat_ctx)
     }
     else
     {
-      const int parser_status = module_ctx->module_hash_decode (hashconfig, hash_buf.digest, hash_buf.salt, hash_buf.esalt, hash_buf.hook_salt, hash_buf.hash_info, line_hash_buf, line_hash_len);
+      if (salt_bufs_dirty == true)
+      {
+        potfile_clear_salt_bufs (&hash_buf, hashconfig);
+
+        salt_bufs_dirty   = false;
+        salt_bufs_touched = false;
+      }
+
+      int parser_status = module_ctx->module_hash_decode (hashconfig, hash_buf.digest, hash_buf.salt, hash_buf.esalt, hash_buf.hook_salt, hash_buf.hash_info, line_hash_buf, line_hash_len);
+
+      if ((parser_status == PARSER_OK) && (salt_bufs_touched == true))
+      {
+        potfile_clear_digest_salt (&hash_buf, hashconfig);
+        potfile_clear_salt_bufs   (&hash_buf, hashconfig);
+
+        parser_status = module_ctx->module_hash_decode (hashconfig, hash_buf.digest, hash_buf.salt, hash_buf.esalt, hash_buf.hook_salt, hash_buf.hash_info, line_hash_buf, line_hash_len);
+      }
+
+      salt_bufs_touched = has_salt_bufs;
 
       if (parser_status != PARSER_OK) continue;
+
+      salt_bufs_dirty = has_salt_bufs;
 
       if (hashconfig->potfile_keep_all_hashes == true)
       {
@@ -926,7 +960,7 @@ int potfile_handle_show (hashcat_ctx_t *hashcat_ctx)
           hash_len += hash_encode (hashcat_ctx->user_options, hashcat_ctx->hashconfig, hashcat_ctx->hashes, hashcat_ctx->module_ctx, (char *) out_buf + tag_len + hash_len, HCBUFSIZ_LARGE - tag_len - hash_len, salt_idx, split_neighbor);
         }
 
-        const int out_len = dynamicx_encode ((char *) out_buf, tag_len, hash_len, hashconfig->separator, HCBUFSIZ_LARGE);
+        const int out_len = dynamicx_encode ((char *) out_buf, hash1->hash_info, tag_len, hash_len, HCBUFSIZ_LARGE);
 
         out_buf[out_len] = 0;
 
@@ -1038,7 +1072,7 @@ int potfile_handle_show (hashcat_ctx_t *hashcat_ctx)
 
         const int hash_len = hash_encode (hashcat_ctx->user_options, hashcat_ctx->hashconfig, hashcat_ctx->hashes, hashcat_ctx->module_ctx, (char *) out_buf + tag_len, HCBUFSIZ_LARGE - tag_len, salt_idx, digest_idx);
 
-        const int out_len = dynamicx_encode ((char *) out_buf, tag_len, hash_len, hashconfig->separator, HCBUFSIZ_LARGE);
+        const int out_len = dynamicx_encode ((char *) out_buf, hash->hash_info, tag_len, hash_len, HCBUFSIZ_LARGE);
 
         out_buf[out_len] = 0;
 
@@ -1209,7 +1243,7 @@ int potfile_handle_left (hashcat_ctx_t *hashcat_ctx)
           hash_len += hash_encode (hashcat_ctx->user_options, hashcat_ctx->hashconfig, hashcat_ctx->hashes, hashcat_ctx->module_ctx, (char *) out_buf + tag_len + hash_len, HCBUFSIZ_LARGE - tag_len - hash_len, salt_idx, split_neighbor);
         }
 
-        const int out_len = dynamicx_encode ((char *) out_buf, tag_len, hash_len, hashconfig->separator, HCBUFSIZ_LARGE);
+        const int out_len = dynamicx_encode ((char *) out_buf, hash1->hash_info, tag_len, hash_len, HCBUFSIZ_LARGE);
 
         out_buf[out_len] = 0;
 
@@ -1284,6 +1318,12 @@ int potfile_handle_left (hashcat_ctx_t *hashcat_ctx)
             binary_len--; // no need for the newline
           }
 
+          // A module that saved nothing returns 0, and the decrement above then leaves a negative
+          // length. memcpy () takes a size_t, so it would arrive as SIZE_MAX. No module in the tree
+          // returns 0 today, and out_buf[out_len] below would index out_buf[-1] just as happily.
+
+          if (binary_len < 0) binary_len = 0;
+
           memcpy (out_buf, binary_buf, binary_len);
 
           out_len = binary_len;
@@ -1296,7 +1336,7 @@ int potfile_handle_left (hashcat_ctx_t *hashcat_ctx)
 
           const int hash_len = hash_encode (hashcat_ctx->user_options, hashcat_ctx->hashconfig, hashcat_ctx->hashes, hashcat_ctx->module_ctx, (char *) out_buf + tag_len, HCBUFSIZ_LARGE - tag_len, salt_idx, digest_idx);
 
-          out_len = dynamicx_encode ((char *) out_buf, tag_len, hash_len, hashconfig->separator, HCBUFSIZ_LARGE);
+          out_len = dynamicx_encode ((char *) out_buf, hash->hash_info, tag_len, hash_len, HCBUFSIZ_LARGE);
         }
 
         out_buf[out_len] = 0;

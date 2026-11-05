@@ -13,6 +13,8 @@
 #include "dynloader.h"
 #include "bridges.h"
 #include "interface.h"
+#include "module_options.h"
+#include "status_rc.h"
 
 /**
  * parsing
@@ -26,6 +28,22 @@ int bridge_filename (const folder_config_t *folder_config, const char *bridge_na
   #else
   return snprintf (out_buf, out_size, "%s/bridges/bridge_%s.so", folder_config->shared_dir, bridge_name);
   #endif
+}
+
+// A bridge, or the plugin it runs, failed. The exit code says so unless a site that knew more already
+// named the cause, such as a plugin path on the command line that does not exist.
+
+void bridges_failed (hashcat_ctx_t *hashcat_ctx)
+{
+  const bridge_ctx_t *bridge_ctx = hashcat_ctx->bridge_ctx;
+
+  // bridges_init () also fails for a hash-mode without a bridge, on a module that does not load
+
+  if (bridge_ctx->enabled == false) return;
+
+  if (status_get_rc_error (hashcat_ctx) != RC_FINAL_OK) return;
+
+  status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_BRIDGE);
 }
 
 bool bridge_load (hashcat_ctx_t *hashcat_ctx, bridge_ctx_t *bridge_ctx, const char *bridge_name)
@@ -65,6 +83,8 @@ bool bridge_load (hashcat_ctx_t *hashcat_ctx, bridge_ctx_t *bridge_ctx, const ch
       #endif
     }
 
+    hcfree (bridge_file);
+
     return false;
   }
 
@@ -73,6 +93,8 @@ bool bridge_load (hashcat_ctx_t *hashcat_ctx, bridge_ctx_t *bridge_ctx, const ch
   if (bridge_ctx->bridge_init == NULL)
   {
     event_log_error (hashcat_ctx, "Cannot load symbol 'bridge_init' in bridge %s", bridge_file);
+
+    hcfree (bridge_file);
 
     return false;
   }
@@ -179,47 +201,77 @@ u32 bridge_workitem_multiple (hashcat_ctx_t *hashcat_ctx, const int bridge_link_
   return (u32) multiple;
 }
 
-bool bridges_init (hashcat_ctx_t *hashcat_ctx)
+// The most candidates a bridge unit takes in one launch, or 0 when there is no bridge to take any.
+//
+// Gated on the bridge being loaded and not only on the mode wanting one. Those are different
+// questions: hashconfig->bridge_type is a property of the hash mode, and whether a bridge is up is a
+// property of the run. A benchmark that walks every hash mode passes through modes that want one
+// while none is loaded, and calling the hook then is a call through a null pointer.
+//
+// Written as a comparison against BRIDGE_DEFAULT rather than a truthiness test, the same as
+// bridge_workitem_multiple () above: BRIDGE_DEFAULT is (void *) -1, which passes a truthiness test
+// and then calls address -1.
+
+u32 bridge_workitem_count (hashcat_ctx_t *hashcat_ctx, const int bridge_link_device)
 {
-  bridge_ctx_t    *bridge_ctx    = hashcat_ctx->bridge_ctx;
-  user_options_t  *user_options  = hashcat_ctx->user_options;
-  hashconfig_t    *hashconfig    = hashcat_ctx->hashconfig;
+  const hashconfig_t *hashconfig = hashcat_ctx->hashconfig;
+  bridge_ctx_t       *bridge_ctx = hashcat_ctx->bridge_ctx;
 
-  // -I normally has no hash mode, and a bridge is chosen by the mode, so there is nothing to load and
-  // the device list is the whole answer. When a mode IS named the bridge it selects is loaded, because
-  // for that mode the units are what compute and a device list without them is not an answer at all.
-  //
-  // Gated on the mode being named rather than on -I alone, because loading a bridge is not free: an
-  // FPGA bridge programs the boards it finds as part of coming up. Naming the mode is the user asking
-  // for exactly that, which is the same thing a real run would do.
+  if (hashconfig->bridge_type == 0) return 0;
+  if (bridge_ctx->enabled == false) return 0;
+  if (bridge_ctx->get_workitem_count == NULL) return 0;
+  if (bridge_ctx->get_workitem_count == BRIDGE_DEFAULT) return 0;
 
-  if ((user_options->backend_info > 0) && (user_options->hash_mode_chgd == false)) return true;
-  if (user_options->hash_info     > 0)    return true;
-  if (user_options->usage         > 0)    return true;
-  if (user_options->left         == true) return true;
-  if (user_options->show         == true) return true;
-  if (user_options->version      == true) return true;
+  const int count = bridge_ctx->get_workitem_count (hashcat_ctx, bridge_ctx->platform_context, bridge_link_device);
 
-  // There is a problem here. At this point, hashconfig is not yet initialized.
-  // This is because initializing hashconfig requires the module to be loaded,
-  // but in order to load the module, we need to know the backend devices.
-  // However, the backend devices are also not yet initialized, because
-  // they require the virtualization count, which we only determine here.
-  // To break this chicken-and-egg problem, we cheat by quick-loading the module
-  // and unloading it afterwards, so it can be properly initialized later.
+  if (count < 1) return 0;
 
-  const int hashconfig_init_rc = hashconfig_init (hashcat_ctx);
+  return (u32) count;
+}
 
-  if (hashconfig_init_rc == -1) return false;
+// A fixed tuning for one unit, when the bridge has one. False means autotune as before, and that is
+// also the answer for a bridge without the hook. The tuning is for the real run, so it is given the
+// real hashes rather than the self test's copy.
 
-  // ok, we can start
+bool bridge_unit_tuning (hashcat_ctx_t *hashcat_ctx, const int bridge_link_device, const double target_msec, u32 *kernel_accel, u32 *kernel_loops)
+{
+  const hashconfig_t *hashconfig = hashcat_ctx->hashconfig;
+  const hashes_t     *hashes     = hashcat_ctx->hashes;
+  bridge_ctx_t       *bridge_ctx = hashcat_ctx->bridge_ctx;
 
-  if (hashconfig->bridge_type == BRIDGE_TYPE_NONE)
-  {
-    hashconfig_destroy (hashcat_ctx);
+  if (hashconfig->bridge_type == 0) return false;
+  if (bridge_ctx->enabled == false) return false;
+  if (bridge_ctx->get_unit_tuning == NULL) return false;
+  if (bridge_ctx->get_unit_tuning == BRIDGE_DEFAULT) return false;
 
-    return true;
-  }
+  u32 accel = 0;
+  u32 loops = 0;
+
+  if (bridge_ctx->get_unit_tuning (hashcat_ctx, bridge_ctx->platform_context, bridge_link_device, hashconfig, hashes, target_msec, &accel, &loops) == false) return false;
+
+  if (accel == 0) return false;
+  if (loops == 0) return false;
+
+  *kernel_accel = accel;
+  *kernel_loops = loops;
+
+  return true;
+}
+
+// Bring up the bridge this hash mode selects. hashconfig has to be live, so bridges_init () quick
+// loads one and a caller that already has one calls this directly.
+//
+// A bridge that is already up is left alone. Loading one is not free: an FPGA bridge programs the
+// boards it finds as part of coming up.
+
+bool bridges_init_late (hashcat_ctx_t *hashcat_ctx)
+{
+  bridge_ctx_t *bridge_ctx = hashcat_ctx->bridge_ctx;
+  hashconfig_t *hashconfig = hashcat_ctx->hashconfig;
+
+  if (bridge_ctx->bridge_handle != NULL) return true;
+
+  if (hashconfig->bridge_type == BRIDGE_TYPE_NONE) return true;
 
   bridge_ctx->enabled = true;
 
@@ -312,12 +364,57 @@ bool bridges_init (hashcat_ctx_t *hashcat_ctx)
     return false;
   }
 
-  // clean up
+  return true;
+}
+
+bool bridges_init (hashcat_ctx_t *hashcat_ctx)
+{
+  user_options_t *user_options = hashcat_ctx->user_options;
+
+  // -I normally has no hash mode, and a bridge is chosen by the mode, so there is nothing to load and
+  // the device list is the whole answer. When a mode IS named the bridge it selects is loaded, because
+  // for that mode the units are what compute and a device list without them is not an answer at all.
+  //
+  // Gated on the mode being named rather than on -I alone, because loading a bridge is not free: an
+  // FPGA bridge programs the boards it finds as part of coming up. Naming the mode is the user asking
+  // for exactly that, which is the same thing a real run would do.
+
+  if ((user_options->backend_info > 0) && (user_options->hash_mode_chgd == false)) return true;
+  if (user_options->hash_info     > 0)    return true;
+  if (user_options->usage         > 0)    return true;
+  if (user_options->left         == true) return true;
+  if (user_options->show         == true) return true;
+  if (user_options->version      == true) return true;
+
+  // Under autodetect the mode below is only the default one, not the mode that will run. A module
+  // that could not be loaded when the options were collected, which was reported then, is not the
+  // reason for such a run to stop.
+
+  if ((user_options->autodetect == true) && (module_options_broken (user_options, user_options->hash_mode) == true)) return true;
+
+  // There is a problem here. At this point, hashconfig is not yet initialized.
+  // This is because initializing hashconfig requires the module to be loaded,
+  // but in order to load the module, we need to know the backend devices.
+  // However, the backend devices are also not yet initialized, because
+  // they require the virtualization count, which we only determine here.
+  // To break this chicken-and-egg problem, we cheat by quick-loading the module
+  // and unloading it afterwards, so it can be properly initialized later.
+
+  const int hashconfig_init_rc = hashconfig_init (hashcat_ctx);
+
+  if (hashconfig_init_rc == -1) return false;
+
+  const bool rc = bridges_init_late (hashcat_ctx);
+
+  // The quick load was only ever to read bridge_type and bridge_name out of the mode. outer_loop
+  // initialises hashconfig properly for the mode it is about to run.
 
   hashconfig_destroy (hashcat_ctx);
 
-  return true;
+  return rc;
 }
+
+
 
 void bridges_destroy (hashcat_ctx_t *hashcat_ctx)
 {
@@ -325,9 +422,26 @@ void bridges_destroy (hashcat_ctx_t *hashcat_ctx)
 
   if (bridge_ctx->enabled == false) return;
 
-  bridge_ctx->platform_term (hashcat_ctx, bridge_ctx->platform_context);
+  // A bridge that never came up is torn down through here as well, because a sweep over the hash modes
+  // carries on past one that cannot start. Two things can be missing by then. The hooks exist only
+  // once the library loaded, and the platform context exists only once platform_init returned one,
+  // which is the same NULL bridges_init_late reads as a failure. A term hook is written against a
+  // context it built, and half of the ones shipped here dereference it without checking, so neither
+  // can be assumed. The unload below still has to run, which is why enabled is set before the load
+  // rather than after it.
+
+  if ((bridge_ctx->platform_term != NULL) && (bridge_ctx->platform_term != BRIDGE_DEFAULT) && (bridge_ctx->platform_context != NULL))
+  {
+    bridge_ctx->platform_term (hashcat_ctx, bridge_ctx->platform_context);
+  }
 
   bridge_unload (bridge_ctx);
+
+  // Every hook in here pointed into the library that was just closed, and enabled said one was
+  // loaded. A run that walks several hash modes comes back through here between them, so leaving
+  // either behind hands the next mode a pointer into an unmapped library.
+
+  memset (bridge_ctx, 0, sizeof (bridge_ctx_t));
 }
 
 bool bridges_salt_prepare (hashcat_ctx_t *hashcat_ctx)
@@ -367,6 +481,13 @@ void bridges_salt_destroy (hashcat_ctx_t *hashcat_ctx)
   if (bridge_ctx->enabled == false) return;
 
   if (bridge_ctx->salt_destroy == MODULE_DEFAULT) return;
+
+  // enabled is set before the library is loaded, so it is still true when platform_init () gave up and
+  // returned no context. A salt_destroy hook is written against a context it built, and the three C
+  // bridges in this tree dereference it without checking, so a run that never got one has nothing to
+  // give back.
+
+  if (bridge_ctx->platform_context == NULL) return;
 
   bridge_ctx->salt_destroy (hashcat_ctx, bridge_ctx->platform_context, hashconfig, hashes);
 }

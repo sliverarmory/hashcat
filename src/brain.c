@@ -19,6 +19,8 @@
 #include "hashes.h"
 #include "event.h"
 #include "memory.h"
+#include "interface.h"
+#include "module_options.h"
 #include "brain.h"
 
 static bool keep_running = true;
@@ -97,6 +99,21 @@ void brain_client_check_features (hashcat_ctx_t *hashcat_ctx)
   event_log_warning (hashcat_ctx, "The candidate feature was switched off. Keyspace coordination is still on, so several");
   event_log_warning (hashcat_ctx, "clients on this session still avoid each other's work.");
   event_log_warning (hashcat_ctx, NULL);
+
+  // Switching the feature off here cannot switch the slow candidate path off with it. That choice is
+  // made from the command line alone, before a hash list exists, because kernel selection and the
+  // base word source are settled during session init and both read it. So this run keeps generating
+  // every candidate on the host for a feature that no longer looks at one, and the only way out is
+  // to say so and let the user ask for the remaining feature by name.
+
+  if (user_options->slow_candidates == true)
+  {
+    event_log_warning (hashcat_ctx, "Candidates are still being generated on the host, which is what the candidate feature");
+    event_log_warning (hashcat_ctx, "needed and what this attack no longer has a use for. Re-run with");
+    event_log_warning (hashcat_ctx, "--brain-client-features=2 to keep keyspace coordination and let the device generate.");
+    event_log_warning (hashcat_ctx, NULL);
+  }
+
   event_log_warning (hashcat_ctx, "Use --brain-client-features to overrule this.");
   event_log_warning (hashcat_ctx, NULL);
 }
@@ -240,6 +257,20 @@ u32 brain_compute_attack (hashcat_ctx_t *hashcat_ctx)
   paw64_update (&state, &skip,  sizeof (skip));
   paw64_update (&state, &limit, sizeof (limit));
 
+  // A range is a pair of positions, and what a position counts is not the same on both producers. The
+  // slow path walks candidates, so one position is one candidate. The device-side path walks base
+  // words and lets the kernel amplify each into a whole mask or ruleset, so one position is many. The
+  // two therefore describe different keyspaces with the same numbers, and a range reserved by one
+  // would be read by the other as covering a completely different part of the attack.
+  //
+  // This only became reachable once a client asking for keyspace coordination alone stopped being
+  // forced onto the slow path. Before that every brain client walked candidates and the unit was
+  // never in question.
+
+  const int slow_candidates = user_options->slow_candidates;
+
+  paw64_update (&state, &slow_candidates, sizeof (slow_candidates));
+
   const int hex_salt = user_options->hex_salt;
 
   paw64_update (&state, &hex_salt, sizeof (hex_salt));
@@ -252,21 +283,38 @@ u32 brain_compute_attack (hashcat_ctx_t *hashcat_ctx)
 
   paw64_update (&state, &opts_type, sizeof (opts_type));
 
-  const int hccapx_message_pair = user_options->hccapx_message_pair;
+  // The module options that have to keep two runs apart name a brain slot, and only the ones the
+  // hash-mode in use registered fill one, so a module that is missing or only registers options of
+  // its own cannot change the identity. Every slot goes in, an unfilled one as BRAIN_SLOT_UNUSED.
 
-  paw64_update (&state, &hccapx_message_pair, sizeof (hccapx_message_pair));
+  u32 brain_slots[BRAIN_SLOTS_MAX];
 
-  const int nonce_error_corrections = user_options->nonce_error_corrections;
+  for (u32 i = 0; i < BRAIN_SLOTS_MAX; i++) brain_slots[i] = BRAIN_SLOT_UNUSED;
 
-  paw64_update (&state, &nonce_error_corrections, sizeof (nonce_error_corrections));
+  const module_options_t *module_options = user_options->module_options;
 
-  const int veracrypt_pim_start = user_options->veracrypt_pim_start;
+  const u32 module_options_cnt = (module_options == NULL) ? 0 : module_options->entries_cnt;
 
-  paw64_update (&state, &veracrypt_pim_start, sizeof (veracrypt_pim_start));
+  // an old hash-mode number loads the module of its new number, which is the one that registered
 
-  const int veracrypt_pim_stop = user_options->veracrypt_pim_stop;
+  const u32 module_hash_mode = module_hash_mode_resolve (hashconfig->hash_mode);
 
-  paw64_update (&state, &veracrypt_pim_stop, sizeof (veracrypt_pim_stop));
+  for (u32 i = 0; i < module_options_cnt; i++)
+  {
+    const module_option_entry_t *entry = &module_options->entries[i];
+
+    const u32 slot = entry->row.brain_slot;
+
+    if (slot == 0) continue;
+
+    if (slot > BRAIN_SLOTS_MAX) continue;
+
+    if (module_option_registered (entry, module_hash_mode) == false) continue;
+
+    brain_slots[slot - 1] = (u32) entry->value;
+  }
+
+  paw64_update (&state, brain_slots, sizeof (brain_slots));
 
   if (user_options_extra->base_source == BASE_SOURCE_FEED)
   {
@@ -907,6 +955,35 @@ bool brain_recv_all (int sockfd, void *buf, size_t len, int flags, hc_device_par
 // writes the brain SERVER's timestamped format straight to stderr, which is wrong for a client and
 // never reaches the session log.
 
+// A socket is closed in any process hashcat starts, for the reason HC_O_NOINHERIT gives in
+// filehandling.c: the Python bridge runs one interpreter per CPU thread, and a brain client's socket is
+// hashcat's conversation with the server, not theirs. SOCK_CLOEXEC would do it in the socket () call but
+// does not exist on macOS, so the flag is set afterwards.
+
+static void sock_no_inherit (MAYBE_UNUSED const int fd)
+{
+  #if defined (_WIN)
+  SetHandleInformation ((HANDLE) (intptr_t) fd, HANDLE_FLAG_INHERIT, 0);
+  #else
+  fcntl (fd, F_SETFD, FD_CLOEXEC);
+  #endif
+}
+
+// A write to a socket whose peer has closed its end raises SIGPIPE, and the default action for that
+// signal ends the whole process. One conversation going away must not take hashcat with it, so every
+// send below passes SEND_FLAGS, which is MSG_NOSIGNAL where the platform has it. macOS and the BSDs
+// have no such send flag and carry SO_NOSIGPIPE instead. This sets it once per socket, so it also
+// covers a send site that forgets the flag.
+
+static void sock_no_sigpipe (MAYBE_UNUSED const int fd)
+{
+  #if defined (SO_NOSIGPIPE)
+  const int one = 1;
+
+  setsockopt (fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *) &one, sizeof (one));
+  #endif
+}
+
 static void brain_client_report (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const char *format, ...)
 {
   if (device_param->brain_link_reported == true) return;
@@ -945,6 +1022,9 @@ bool brain_client_connect (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device
 
     return false;
   }
+
+  sock_no_inherit (brain_link_client_fd);
+  sock_no_sigpipe (brain_link_client_fd);
 
   #if defined (__linux__)
   const int one = 1;
@@ -1026,7 +1106,7 @@ bool brain_client_connect (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device
 
   u32 brain_link_version = BRAIN_LINK_VERSION_CUR;
 
-  if (brain_send (brain_link_client_fd, &brain_link_version, sizeof (brain_link_version), 0, NULL, NULL) == false)
+  if (brain_send (brain_link_client_fd, &brain_link_version, sizeof (brain_link_version), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_client_report (hashcat_ctx, device_param, "Brain server %s port %d: send: %s", host_real, port, strerror (errno));
 
@@ -1068,7 +1148,7 @@ bool brain_client_connect (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device
 
   u64 response = brain_auth_hash (challenge, password, strlen (password));
 
-  if (brain_send (brain_link_client_fd, &response, sizeof (response), 0, NULL, NULL) == false)
+  if (brain_send (brain_link_client_fd, &response, sizeof (response), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_client_report (hashcat_ctx, device_param, "Brain server %s port %d: send: %s", host_real, port, strerror (errno));
 
@@ -1152,6 +1232,11 @@ void brain_client_disconnect (hc_device_param_t *device_param)
 
 bool brain_client_reserve (hc_device_param_t *device_param, const status_ctx_t *status_ctx, u64 words_off, u64 work, u64 *overlap)
 {
+  // Nothing is reserved until the reply has been read and checked, so a caller that carries on after
+  // a failure skips nothing. A partial read would otherwise leave whatever arrived in there.
+
+  *overlap = 0;
+
   const int brain_link_client_fd = device_param->brain_link_client_fd;
 
   if (brain_link_client_fd == -1) return false;
@@ -1159,10 +1244,22 @@ bool brain_client_reserve (hc_device_param_t *device_param, const status_ctx_t *
   u8 operation = BRAIN_OPERATION_ATTACK_RESERVE;
 
   if (brain_send (brain_link_client_fd, &operation, sizeof (operation), SEND_FLAGS, device_param, status_ctx) == false) return false;
-  if (brain_send (brain_link_client_fd, &words_off, sizeof (words_off),          0, device_param, status_ctx) == false) return false;
-  if (brain_send (brain_link_client_fd, &work,           sizeof (work),          0, device_param, status_ctx) == false) return false;
+  if (brain_send (brain_link_client_fd, &words_off, sizeof (words_off), SEND_FLAGS, device_param, status_ctx) == false) return false;
+  if (brain_send (brain_link_client_fd, &work,           sizeof (work), SEND_FLAGS, device_param, status_ctx) == false) return false;
 
-  if (brain_recv (brain_link_client_fd, overlap,          sizeof (u64),          0, device_param, status_ctx) == false) return false;
+  u64 reply = 0;
+
+  if (brain_recv (brain_link_client_fd, &reply, sizeof (reply), 0, device_param, status_ctx) == false) return false;
+
+  // The overlap is the leading part of the range we asked for that the server has already covered,
+  // so it can never be longer than the range. A larger one wraps the work count in every caller: the
+  // mask dispatcher hands that count to the device as its work item count and the launch reads far
+  // outside the buffers it was given. The reply is refused like any other dead link, and the chunk
+  // is then tested with no dedup rather than not at all.
+
+  if (reply > work) return false;
+
+  *overlap = reply;
 
   return true;
 }
@@ -2416,6 +2513,8 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
 
   // client configuration
 
+  sock_no_sigpipe (client_fd);
+
   #if defined (__linux__)
   const int one = 1;
 
@@ -2448,7 +2547,7 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
 
   u32 brain_link_version_ok = (brain_link_version >= (u32) BRAIN_LINK_VERSION_MIN) ? 1 : 0;
 
-  if (brain_send (client_fd, &brain_link_version_ok, sizeof (brain_link_version_ok), 0, NULL, NULL) == false)
+  if (brain_send (client_fd, &brain_link_version_ok, sizeof (brain_link_version_ok), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_logging (stderr, client_idx, "brain_send: %s\n", strerror (errno));
 
@@ -2472,7 +2571,7 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
 
   u32 challenge = brain_auth_challenge ();
 
-  if (brain_send (client_fd, &challenge, sizeof (challenge), 0, NULL, NULL) == false)
+  if (brain_send (client_fd, &challenge, sizeof (challenge), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_logging (stderr, client_idx, "brain_send: %s\n", strerror (errno));
 
@@ -2500,7 +2599,7 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
 
   u32 password_ok = (auth_hash == response) ? 1 : 0;
 
-  if (brain_send (client_fd, &password_ok, sizeof (password_ok), 0, NULL, NULL) == false)
+  if (brain_send (client_fd, &password_ok, sizeof (password_ok), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_logging (stderr, client_idx, "brain_send: %s\n", strerror (errno));
 
@@ -2685,7 +2784,7 @@ HC_THREAD_FUNC brain_server_handle_client (void *p)
 
   u64 highest = brain_server_highest_attack (brain_server_db_attack);
 
-  if (brain_send (client_fd, &highest, sizeof (highest), 0, NULL, NULL) == false)
+  if (brain_send (client_fd, &highest, sizeof (highest), SEND_FLAGS, NULL, NULL) == false)
   {
     brain_logging (stderr, client_idx, "brain_send: %s\n", strerror (errno));
 
@@ -3398,15 +3497,28 @@ int brain_feed (hashcat_ctx_t *hashcat_ctx)
 
     if (eof == false)
     {
-      const size_t line_len = in_superchop (line_buf);
+      size_t line_len = in_superchop (line_buf);
 
       read_cnt++;
 
+      // --stdout writes a candidate it cannot print as $HEX[...], and the wordlist reader decodes that
+      // form before a client hashes the candidate. Stored as spelled, it is an entry no client asks
+      // about, and the candidate is tested again on every run. --wordlist-autohex-disable keeps the
+      // spelling here, as it does in the reader.
+
+      if (user_options->wordlist_autohex == true)
+      {
+        if (is_hexify ((const u8 *) line_buf, line_len) == true)
+        {
+          line_len = exec_unhexify ((const u8 *) line_buf, line_len, (u8 *) line_buf, line_len);
+        }
+      }
+
       // Mirror what the wordlist reader accepts, so that feeding a list and then cracking that same
-      // list feed the brain and query it with the identical set of candidates. src/wordlist.c drops a
-      // word longer than PW_MAX and keeps everything shorter, an empty line included, so this does the
-      // same. Storing an over-length word would only add an entry no cracking client can ever ask
-      // about, and skipping the empty one would leave a candidate that a client does ask about
+      // list feed the brain and query it with the identical set of candidates. The reader drops a word
+      // longer than PW_MAX once it is decoded and keeps everything shorter, an empty line included, so
+      // this does the same. Storing an over-length word would only add an entry no cracking client can
+      // ever ask about, and skipping the empty one would leave a candidate that a client does ask about
       // un-deduplicated.
 
       if (line_len > PW_MAX)

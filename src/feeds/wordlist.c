@@ -29,7 +29,9 @@
 #include "timer.h"
 #include "event.h"
 #include "feed.h"
+#include "feed_error.h"
 #include "wordlist.h"
+#include "status_rc.h"
 
 #if defined (_WIN)
 #include "mmap_windows.c"
@@ -48,42 +50,15 @@ static bool source_restart (feed_thread_t *feed_thread);
 
 static int wordlist_next (generic_global_ctx_t *global_ctx, feed_global_t *feed_global, generic_thread_ctx_t *thread_ctx, feed_thread_t *feed_thread, u8 *out_buf, const int out_size);
 
-static void error_set (generic_global_ctx_t *global_ctx, const char *fmt, ...)
-{
-  global_ctx->error = true;
-
-  va_list ap;
-  va_start (ap, fmt);
-
-  vsnprintf (global_ctx->error_msg, sizeof (global_ctx->error_msg), fmt, ap);
-
-  va_end (ap);
-}
-
-// The four per device entry points report here instead, so that one device's failure does not speak
-// for the others and does not stay set for the rest of the run.
-
-static void thread_error_set (generic_thread_ctx_t *thread_ctx, const char *fmt, ...)
-{
-  thread_ctx->error = true;
-
-  va_list ap;
-  va_start (ap, fmt);
-
-  vsnprintf (thread_ctx->error_msg, sizeof (thread_ctx->error_msg), fmt, ap);
-
-  va_end (ap);
-}
-
 // Hand out the word that starts here, and say where the next one starts. Finding the end of it and
 // taking the line ending off is hc_line_next () in memchr.h, which is the same code the stdin feed and
 // the line counter use.
 
-static size_t process_word (const u8 *buf, const size_t max_len, u8 *out_buf, const size_t out_size, size_t *out_len)
+static size_t process_word (const hc_memchr_t hc_memchr, const u8 *buf, const size_t max_len, u8 *out_buf, const size_t out_size, size_t *out_len)
 {
   size_t word_len = 0;
 
-  const size_t step = hc_line_next (buf, max_len, &word_len);
+  const size_t step = hc_line_next_with (hc_memchr, buf, max_len, &word_len);
 
   // hashcat hands out a pointer straight into the buffer it uploads, so there is no room past
   // out_size. Write no more than that, and still report the real length: hashcat rejects an
@@ -243,11 +218,18 @@ static bool source_add_path (generic_global_ctx_t *global_ctx, feed_global_t *fe
 
     if (source_add (global_ctx, feed_global, files[i]) == false)
     {
+      // scan_directory () allocates one string per file plus the array holding them, and source_add ()
+      // keeps a copy of the path rather than the pointer, so the strings go back here with the array.
+
+      for (int j = 0; files[j] != NULL; j++) hcfree (files[j]);
+
       hcfree (files);
 
       return false;
     }
   }
+
+  for (int i = 0; files[i] != NULL; i++) hcfree (files[i]);
 
   hcfree (files);
 
@@ -570,7 +552,7 @@ static u64 source_of_offset (const feed_global_t *feed_global, const u64 offset)
 // a feed that takes something else on the command line as well, as the table feed takes its table,
 // still wants every wordlist argument laid end to end the same way.
 
-static bool wordlist_init (generic_global_ctx_t *global_ctx, feed_global_t *feed_global, const int from, const int to)
+static bool wordlist_init (generic_global_ctx_t *global_ctx, feed_global_t *feed_global, hashcat_ctx_t *hashcat_ctx, const int from, const int to)
 {
   // Every argument after the plugin name is a wordlist or a directory of them, and they are laid end
   // to end into one keyspace. -a 0 runs several dictionaries as several attacks instead, which is why
@@ -578,12 +560,28 @@ static bool wordlist_init (generic_global_ctx_t *global_ctx, feed_global_t *feed
 
   for (int i = from; i < to; i++)
   {
-    if (source_add_path (global_ctx, feed_global, global_ctx->workv[i]) == false) return false;
+    if (source_add_path (global_ctx, feed_global, global_ctx->workv[i]) == false)
+    {
+      // a wordlist that is there and does not open is the machine's, and stays -1
+
+      if (hc_path_exist (global_ctx->workv[i]) == false)
+      {
+        const int path_errno = errno;
+
+        status_set_rc_error (hashcat_ctx, path_missing_rc (path_errno));
+      }
+
+      return false;
+    }
   }
 
   if (feed_global->sources_cnt == 0)
   {
     error_set (global_ctx, "No usable dictionary file found.");
+
+    // The wordlists exist, because the command line was checked for that. What is wrong is their content.
+
+    status_set_rc_error (hashcat_ctx, RC_FINAL_ERROR_TASK);
 
     return false;
   }
@@ -699,7 +697,6 @@ static u64 wordlist_keyspace (generic_global_ctx_t *global_ctx, generic_thread_c
       cache_hit.dictfile      = source->path;
       cache_hit.stat.st_size  = source->size;
       cache_hit.cached_cnt    = source->line_count;
-      cache_hit.keyspace      = source->line_count;
 
       EVENT_DATA (EVENT_WORDLIST_CACHE_HIT, &cache_hit, sizeof (cache_hit));
 
@@ -729,11 +726,17 @@ static u64 wordlist_keyspace (generic_global_ctx_t *global_ctx, generic_thread_c
 
     source->seek_db = seekdb_build (feed_thread, seekdb_file, source->path, &source->seek_count, &source->line_count, &source->size, &source->seek_step, &source->frame_db, &source->frame_count, source_ident, hashcat_ctx);
 
+    hcfree (seekdb_file);
+
+    // The error is what stops the run. The return value alone reads as a feed that cannot count itself.
+
     if (source->seek_db == NULL)
     {
-      event_log_error (hashcat_ctx, "%s: could not build the seek index for this wordlist.", source->path);
+      error_set (global_ctx, "%s: could not build the seek index for this wordlist.", source->path);
 
-      return -1;
+      wordlist_thread_term (feed_thread);
+
+      return GENERIC_KEYSPACE_UNKNOWN;
     }
 
     cache_generate_t cache_generate;
@@ -742,12 +745,9 @@ static u64 wordlist_keyspace (generic_global_ctx_t *global_ctx, generic_thread_c
     cache_generate.comp        = source->size;
     cache_generate.percent     = 100;
     cache_generate.cnt         = source->line_count;
-    cache_generate.cnt2        = source->line_count;
     cache_generate.runtime     = hc_timer_get (start);
 
     EVENT_DATA (EVENT_WORDLIST_CACHE_GENERATE, &cache_generate, sizeof (cache_generate));
-
-    hcfree (seekdb_file);
 
     feed_global->line_count += source->line_count;
   }
@@ -802,6 +802,8 @@ static feed_thread_t *wordlist_thread_init (generic_thread_ctx_t *thread_ctx)
   feed_thread->fd_off      = 0;
   feed_thread->fd_line     = 0;
 
+  feed_thread->memchr      = hc_memchr_get ();
+
   return feed_thread;
 }
 
@@ -841,6 +843,28 @@ static int wordlist_next_source (generic_global_ctx_t *global_ctx, feed_global_t
   return word_len;
 }
 
+// How many bytes of byte order mark the front of a source carries.
+//
+// hc_string_bom_size () reads a fixed five bytes, which a wordlist shorter than that does not have,
+// and a mapped file whose length is a multiple of the page size has nothing readable behind it. The
+// bytes in hand are copied into a padded buffer so the test stays the one the rest of hashcat makes,
+// and a mark that claims more bytes than the source holds is no mark at all.
+
+static size_t wordlist_bom_size (const u8 *buf, const size_t len)
+{
+  u8 head[8] = { 0 };
+
+  const size_t take = MIN (len, sizeof (head));
+
+  memcpy (head, buf, take);
+
+  const size_t bom = (size_t) hc_string_bom_size (head);
+
+  if (bom > len) return 0;
+
+  return bom;
+}
+
 static int wordlist_next (generic_global_ctx_t *global_ctx, feed_global_t *feed_global, generic_thread_ctx_t *thread_ctx, feed_thread_t *feed_thread, u8 *out_buf, const int out_size)
 {
   // A mapped source always has the whole file in front of it. A compressed one has a window, and
@@ -864,13 +888,22 @@ static int wordlist_next (generic_global_ctx_t *global_ctx, feed_global_t *feed_
 
   const size_t remaining = fd_len - fd_off;
 
+  // A byte order mark belongs to the file rather than to the first word in it. hc_fopen () drops one
+  // for every caller that goes through it, but a plain wordlist is opened raw and mapped, and a
+  // compressed one carries its mark inside the compressed bytes, so neither has been looked at yet.
+  // Only the first line of a source can hold one, so this costs a predictable branch per word.
+
+  const size_t bom = (feed_thread->fd_line == 0) ? wordlist_bom_size (fd_mem + fd_off, remaining) : 0;
+
+  const size_t avail = remaining - bom;
+
   size_t word_len = 0;
 
-  const size_t step = process_word (fd_mem + fd_off, remaining, out_buf, out_size, &word_len);
+  const size_t step = process_word (feed_thread->memchr, fd_mem + fd_off + bom, avail, out_buf, out_size, &word_len);
 
-  if (step < remaining)
+  if (step < avail)
   {
-    feed_thread->fd_off += step + 1;
+    feed_thread->fd_off += bom + step + 1;
   }
   else
   {
@@ -880,7 +913,7 @@ static int wordlist_next (generic_global_ctx_t *global_ctx, feed_global_t *feed_
 
     feed_thread->fd_off += remaining;
 
-    if (feed_thread->compressed == true) word_len = source_finish_line (feed_thread, fd_mem + fd_off, remaining);
+    if (feed_thread->compressed == true) word_len = source_finish_line (feed_thread, fd_mem + fd_off + bom, avail);
   }
 
   feed_thread->fd_line++;

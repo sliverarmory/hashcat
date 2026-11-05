@@ -48,6 +48,11 @@ u32         module_salt_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, 
 const char *module_st_hash        (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return ST_HASH;         }
 const char *module_st_pass        (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return ST_PASS;         }
 
+const char *module_usage_notice (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
+{
+  return "You can use https://github.com/openwall/john/blob/bleeding-jumbo/run/office2john.py to extract the $oldoffice$ line, dropping the file name and colon it prints in front. This mode also needs the RC4 key appended after a colon, which the extractor does not emit: crack the $oldoffice$ line with mode 9810 first to recover the key, then append it as ':<key>'.";
+}
+
 typedef struct oldoffice34
 {
   u32 version;
@@ -190,16 +195,16 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   oldoffice34->rc4key[1] = 0;
   oldoffice34->rc4key[0] = 0;
 
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[0]) << 28;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[1]) << 24;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[2]) << 20;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[3]) << 16;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[4]) << 12;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[5]) <<  8;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[6]) <<  4;
-  oldoffice34->rc4key[0] |= hex_convert (rc4key_pos[7]) <<  0;
-  oldoffice34->rc4key[1] |= hex_convert (rc4key_pos[8]) << 28;
-  oldoffice34->rc4key[1] |= hex_convert (rc4key_pos[9]) << 24;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[0]) << 28;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[1]) << 24;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[2]) << 20;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[3]) << 16;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[4]) << 12;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[5]) <<  8;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[6]) <<  4;
+  oldoffice34->rc4key[0] |= (u32) hex_convert (rc4key_pos[7]) <<  0;
+  oldoffice34->rc4key[1] |= (u32) hex_convert (rc4key_pos[8]) << 28;
+  oldoffice34->rc4key[1] |= (u32) hex_convert (rc4key_pos[9]) << 24;
 
   oldoffice34->rc4key[0] = byte_swap_32 (oldoffice34->rc4key[0]);
   oldoffice34->rc4key[1] = byte_swap_32 (oldoffice34->rc4key[1]);
@@ -321,6 +326,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_benchmark_mask           = MODULE_DEFAULT;
   module_ctx->module_benchmark_charset        = MODULE_DEFAULT;
   module_ctx->module_benchmark_salt           = MODULE_DEFAULT;
+  module_ctx->module_benchmark_cost           = MODULE_DEFAULT;
   module_ctx->module_bridge_name              = MODULE_DEFAULT;
   module_ctx->module_bridge_type              = MODULE_DEFAULT;
   module_ctx->module_build_plain_postprocess  = MODULE_DEFAULT;
@@ -346,10 +352,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_status       = MODULE_DEFAULT;
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
+  module_ctx->module_hash_hints               = MODULE_DEFAULT;
   module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
+  module_ctx->module_hash_recipe              = MODULE_DEFAULT;
   module_ctx->module_hashes_count_min         = MODULE_DEFAULT;
   module_ctx->module_hashes_count_max         = MODULE_DEFAULT;
   module_ctx->module_hlfmt_disable            = MODULE_DEFAULT;
@@ -368,8 +376,10 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_kernel_loops_min         = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_max       = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_min       = MODULE_DEFAULT;
+  module_ctx->module_kern_bits                = MODULE_DEFAULT;
   module_ctx->module_kern_type                = module_kern_type;
   module_ctx->module_kern_type_dynamic        = MODULE_DEFAULT;
+  module_ctx->module_length_sort              = MODULE_DEFAULT;
   module_ctx->module_opti_type                = module_opti_type;
   module_ctx->module_opts_type                = module_opts_type;
   module_ctx->module_outfile_check_disable    = MODULE_DEFAULT;
@@ -380,6 +390,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_pwdump_column            = MODULE_DEFAULT;
   module_ctx->module_pw_max                   = module_pw_max;
   module_ctx->module_pw_min                   = MODULE_DEFAULT;
+  module_ctx->module_register_options         = MODULE_DEFAULT;
   module_ctx->module_salt_max                 = MODULE_DEFAULT;
   module_ctx->module_salt_min                 = MODULE_DEFAULT;
   module_ctx->module_salt_type                = module_salt_type;
@@ -388,6 +399,6 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_st_pass                  = module_st_pass;
   module_ctx->module_tmp_size                 = MODULE_DEFAULT;
   module_ctx->module_unstable_warning         = MODULE_DEFAULT;
-  module_ctx->module_usage_notice             = MODULE_DEFAULT;
+  module_ctx->module_usage_notice             = module_usage_notice;
   module_ctx->module_warmup_disable           = MODULE_DEFAULT;
 }

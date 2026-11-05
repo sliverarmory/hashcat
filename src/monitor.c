@@ -128,6 +128,8 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
 
   bool feeder_aborted = false;
 
+  bool stdin_overrun_warned = false;
+
   u32 restore_left  = user_options->restore_timer;
   u32 remove_left   = user_options->remove_timer;
   u32 status_left   = user_options->status_timer;
@@ -196,7 +198,14 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
 
         if (temperature > (int) temp_abort)
         {
-          EVENT_DATA (EVENT_MONITOR_TEMP_ABORT, &backend_devices_idx, sizeof (int));
+          if (bridge_owns == true)
+          {
+            EVENT_DATA (EVENT_MONITOR_TEMP_ABORT_BRIDGE, &backend_devices_idx, sizeof (int));
+          }
+          else
+          {
+            EVENT_DATA (EVENT_MONITOR_TEMP_ABORT, &backend_devices_idx, sizeof (int));
+          }
 
           myabort (hashcat_ctx);
         }
@@ -209,7 +218,7 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
         if ((bridge_owns == true) && (feeder_idx == -1)) feeder_idx = backend_devices_idx;
         #if defined (__APPLE__)
         // experimental feature, check the "Sensor Graphic Hot" sensor through IOKIT/SMC to catch a GPU overtemp alarm
-        else if (temperature > (int) (temp_abort - 10))
+        else if ((bridge_owns == false) && (temperature > (int) (temp_abort - 10)))
         {
           if (hm_IOKIT_SMCGetSensorGraphicHot (hashcat_ctx) == 1)
           {
@@ -248,6 +257,15 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
 
         if (device_param->skipped == true) continue;
         if (device_param->skipped_warning == true) continue;
+
+        // One physical card can appear as many devices, as bridge units or under
+        // --backend-devices-virtmulti, and throttling is a property of the card. Counting it once per
+        // clone drove slowdown_warnings past all three thresholds inside a single tick, so the three
+        // warnings fired together instead of over three sustained ticks, and the decrement below
+        // cleared the counter just as fast. Only the device carrying the hwmon line for that hardware
+        // is asked.
+
+        if (hm_is_hwmon_group_leader (hashcat_ctx, backend_devices_idx) == false) continue;
 
         const int rc_throttle = hm_get_throttle_with_devices_idx (hashcat_ctx, backend_devices_idx);
 
@@ -323,6 +341,15 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
 
         remove_left = user_options->remove_timer;
       }
+    }
+
+    // --stdin-count check
+
+    if ((stdin_overrun_warned == false) && (status_get_stdin_count_exceeded (hashcat_ctx) == true))
+    {
+      stdin_overrun_warned = true;
+
+      EVENT_DATA (EVENT_MONITOR_STDIN_OVERRUN, NULL, 0);
     }
 
     if (status_check == true)
@@ -464,6 +491,13 @@ static int monitor (hashcat_ctx_t *hashcat_ctx)
         status_ctx->timer_bypass_start += 1;
       }
     }
+  }
+
+  // final round of the --stdin-count check, for a pipe that passed it after the last tick
+
+  if ((stdin_overrun_warned == false) && (status_get_stdin_count_exceeded (hashcat_ctx) == true))
+  {
+    EVENT_DATA (EVENT_MONITOR_STDIN_OVERRUN, NULL, 0);
   }
 
   // final round of save_hash

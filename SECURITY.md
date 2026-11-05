@@ -26,7 +26,7 @@ The important security boundary is between the person running hashcat and input 
 
 If the answer is yes, the issue may be a vulnerability. If the only person controlling the input is the person running hashcat, it is normally a bug rather than a vulnerability. Hashcat is not designed to protect itself from its own user. That user already controls its command line, its input files and the privileges under which it runs.
 
-Hashcat runs as a single process with the privileges of the user who started it. It does not require root or sudo, does not install a service and does not provide a sandbox. It does not listen on a network socket unless brain functionality is explicitly enabled.
+Hashcat runs as a single process with the privileges of the user who started it. It does not require root or sudo, does not install a service and does not provide a sandbox. It does not listen on a network socket unless brain functionality is explicitly enabled. With an Arty Z7 FPGA board in use, it also exchanges datagrams with that board, see below.
 
 ## Instructions, code and data
 
@@ -43,8 +43,6 @@ Data controls what hashcat computes. It must never decide what hashcat executes.
 Information disclosure crosses the boundary too. If crafted data can make hashcat put unrelated memory or file contents into its output, that is a vulnerability. Resource exhaustion through a local data file does not cross it. A crafted file that makes hashcat hang or consume all memory is a bug we want reported, but the user started the process, can watch it and can stop it. Costing the user time does not give the attacker anything. The brain server is the exception. A remote peer that can exhaust its resources before authentication completes is inside the boundary.
 
 A restore file stores the command line of an interrupted session. `--restore` does not execute it. It prints the stored command line and exits. The printed line is quoted. Bytes outside printable ASCII are escaped. The user decides whether to run it. A crafted restore file that can exploit the parser, break the quoting or disguise what is printed is inside the boundary. **Read the printed command line before you run it.**
-
-`--restore-auto` resumes in one step instead and executes the stored command line. Supplying that flag is the trust decision, like loading a bridge. **Do not use `--restore-auto` with a restore file from an untrusted source.**
 
 Some data formats are expressive. A rule file is a small program in the rule language. That does not turn it into code in the sense above. The rule engine may only transform and reject password candidates. A rule file, however complex, must stay inside that function. If a crafted rule file can escape the rule engine, that is a vulnerability.
 
@@ -71,6 +69,16 @@ The protocol is intentionally simple. The server sends a 32 bit challenge. The c
 The protocol provides no encryption or transport integrity. A party able to observe or modify the connection can read or change the traffic. Modified traffic can interfere with deduplication and cause candidates to be skipped. If `--brain-host` is not given, the server listens on all interfaces. This may be appropriate on an isolated cracking network. Do not expose it directly to an untrusted network. **If brain traffic must cross a network you do not control, use a VPN, SSH tunnel or another trusted encrypted transport.**
 
 These protocol properties are part of the design and are not themselves vulnerabilities. That includes the authentication. A party that observed a handshake can attack the brain password offline. The response is stretched by a fixed iteration count, but there is no memory hardness and the only salt is the observed challenge, so this is far weaker than a password hashing function. Recovering it that way and connecting later is a consequence of the design, not an authentication bypass. The transport advice above is the mitigation. Memory safety issues, real authentication bypasses and similar implementation defects are different, in the server and in the client alike. In particular, an issue reachable by a remote peer before authentication completes is within hashcat's security boundary.
+
+## The Arty Z7 FPGA link
+
+Hash mode 75000 drives an Arty Z7 FPGA board over Ethernet. hashcat sends candidates to the board and reads results back over UDP, so with such a board in use, datagrams from the network reach both hashcat and the application running on the board. Both ends are inside the security boundary described above.
+
+Every datagram is encrypted and authenticated with ChaCha20-Poly1305, as defined in RFC 8439. hashcat chooses a new random key for every session and writes it into the board's memory over the board's USB connection, so the key never travels over the network. Each direction numbers its datagrams. A datagram is accepted only if its tag is valid and its number is higher than the last one accepted. A forged, altered or replayed datagram is dropped without an answer, and protocol replies go only to the host whose datagrams authenticate. Outside the protocol the board answers ARP and ICMP echo for its own address from any host, as any IP host does, and an echo reply carries back only the request's own payload.
+
+A party on the network can still delay or interrupt a session by flooding the board, and can see how much traffic flows. That is a consequence of the design and not a vulnerability. A forged datagram that is accepted, a way to make either end read or write outside its buffers, or a way to recover the key from the traffic is a vulnerability.
+
+Anyone who can reach the board's USB connection controls the board, including its key. That connection is as trusted as the machine it is plugged into.
 
 ## CVE identifiers
 

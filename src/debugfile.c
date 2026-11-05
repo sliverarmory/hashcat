@@ -11,7 +11,7 @@
 #include "locking.h"
 #include "debugfile.h"
 
-static void debugfile_format_plain (hashcat_ctx_t *hashcat_ctx, const u8 *plain_ptr, const u32 plain_len)
+static void debugfile_format_field (hashcat_ctx_t *hashcat_ctx, const u8 *field_ptr, const u32 field_len)
 {
   debugfile_ctx_t *debugfile_ctx = hashcat_ctx->debugfile_ctx;
 
@@ -19,23 +19,23 @@ static void debugfile_format_plain (hashcat_ctx_t *hashcat_ctx, const u8 *plain_
 
   int needs_hexify = 0;
 
-  for (u32 i = 0; i < plain_len; i++)
+  for (u32 i = 0; i < field_len; i++)
   {
-    if (plain_ptr[i] < 0x20)
+    if (field_ptr[i] < 0x20)
     {
       needs_hexify = 1;
 
       break;
     }
 
-    if (plain_ptr[i] > 0x7f)
+    if (field_ptr[i] > 0x7f)
     {
       needs_hexify = 1;
 
       break;
     }
 
-    if (plain_ptr[i] == ':')
+    if (field_ptr[i] == ':')
     {
       needs_hexify = 1;
 
@@ -47,16 +47,43 @@ static void debugfile_format_plain (hashcat_ctx_t *hashcat_ctx, const u8 *plain_
   {
     hc_fprintf (&debugfile_ctx->fp, "$HEX[");
 
-    for (u32 i = 0; i < plain_len; i++)
+    for (u32 i = 0; i < field_len; i++)
     {
-      hc_fprintf (&debugfile_ctx->fp, "%02x", plain_ptr[i]);
+      hc_fprintf (&debugfile_ctx->fp, "%02x", field_ptr[i]);
     }
 
     hc_fprintf (&debugfile_ctx->fp, "]");
   }
   else
   {
-    hc_fwrite (plain_ptr, plain_len, 1, &debugfile_ctx->fp);
+    hc_fwrite (field_ptr, field_len, 1, &debugfile_ctx->fp);
+  }
+}
+
+// A rule rebuilt from its compiled form already writes every operand that cannot stand for itself
+// as \xHH. Anything else here is what a feed reports, and for the association attack that is a line
+// of its rule file, already in rule syntax. Both are written as they are, which keeps them loadable
+// as rules. Only a line ending is escaped here, so a record stays on one line whatever a feed
+// reports.
+
+static void debugfile_format_rule (hashcat_ctx_t *hashcat_ctx, const u8 *rule_ptr, const u32 rule_len)
+{
+  debugfile_ctx_t *debugfile_ctx = hashcat_ctx->debugfile_ctx;
+
+  if (debugfile_ctx->enabled == false) return;
+
+  for (u32 i = 0; i < rule_len; i++)
+  {
+    const u8 c = rule_ptr[i];
+
+    if ((c == '\n') || (c == '\r'))
+    {
+      hc_fprintf (&debugfile_ctx->fp, "\\x%02x", c);
+
+      continue;
+    }
+
+    hc_fputc (c, &debugfile_ctx->fp);
   }
 }
 
@@ -71,23 +98,20 @@ void debugfile_write_append (hashcat_ctx_t *hashcat_ctx, const u8 *rule_buf, con
 
   if ((debug_mode == 2) || (debug_mode == 3) || (debug_mode == 4) || (debug_mode == 5) || (debug_mode == DEBUG_MODE_FEED))
   {
-    debugfile_format_plain (hashcat_ctx, orig_plain_ptr, orig_plain_len);
+    debugfile_format_field (hashcat_ctx, orig_plain_ptr, orig_plain_len);
 
     if ((debug_mode == 3) || (debug_mode == 4) || (debug_mode == 5) || (debug_mode == DEBUG_MODE_FEED)) hc_fputc (':', &debugfile_ctx->fp);
   }
 
-  if (hc_lockfile (&debugfile_ctx->fp) == -1)
-  {
-    event_log_error (hashcat_ctx, "%s: Failed to lock file.", debugfile_ctx->filename);
-  }
+  hc_lockfile_warn (hashcat_ctx, &debugfile_ctx->fp, debugfile_ctx->filename, &debugfile_ctx->lock_warned);
 
-  hc_fwrite (rule_buf, rule_len, 1, &debugfile_ctx->fp);
+  debugfile_format_rule (hashcat_ctx, rule_buf, rule_len);
 
   if ((debug_mode == 4) || (debug_mode == 5) || (debug_mode == DEBUG_MODE_FEED))
   {
     hc_fputc (':', &debugfile_ctx->fp);
 
-    debugfile_format_plain (hashcat_ctx, mod_plain_ptr, mod_plain_len);
+    debugfile_format_field (hashcat_ctx, mod_plain_ptr, mod_plain_len);
   }
 
   if (debug_mode == 5)
@@ -136,10 +160,28 @@ void debugfile_write_append (hashcat_ctx_t *hashcat_ctx, const u8 *rule_buf, con
 
   hc_fflush (&debugfile_ctx->fp);
 
-  if (hc_unlockfile (&debugfile_ctx->fp))
-  {
-    event_log_error (hashcat_ctx, "%s: Failed to unlock file.", debugfile_ctx->filename);
-  }
+  hc_unlockfile_warn (hashcat_ctx, &debugfile_ctx->fp, debugfile_ctx->filename, &debugfile_ctx->lock_warned);
+}
+
+// Whether anything will read back the rule and the base word a candidate was built from. --debug-mode
+// is the only thing that does, through build_debugdata (), and the straight kernel is the one that
+// applies a rule, so it is the one that has a rule to report. That is attack mode 0, 8 and 9 as it
+// always was, and now also the mask attacks, which reach it through a feed once they are given rules.
+//
+// The slow candidate producer and the host memory budget ask here as well, so a run that will report
+// nothing neither stages the base words nor pays for the buffer that would hold them.
+
+bool debugfile_wants_base (const hashcat_ctx_t *hashcat_ctx)
+{
+  const debugfile_ctx_t      *debugfile_ctx      = hashcat_ctx->debugfile_ctx;
+  const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
+
+  if (debugfile_ctx->mode == 0) return false;
+
+  if (user_options_extra->attack_kern == ATTACK_KERN_STRAIGHT) return true;
+  if (user_options_extra->attack_kern == ATTACK_KERN_PCFG) return true;
+
+  return false;
 }
 
 int debugfile_init (hashcat_ctx_t *hashcat_ctx)

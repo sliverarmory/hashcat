@@ -68,8 +68,16 @@ HC_API const char *stroptitype (const u32 opti_type);
 HC_PLUGIN_API u32 previous_power_of_two (const u32 x);
 HC_PLUGIN_API u32 next_power_of_two (const u32 x);
 
+// A percentage on its way to a two decimal print, held off 0 and 100 until the fraction gets there.
+
+HC_API double hc_percent_display (const double percent);
+
 // On/off environment switch, looked up once. Pass a static int initialised to -1 as the cache.
 bool hc_env_flag (const char *name, int *cache);
+
+// Byte value of an environment switch written in MiB, looked up once. 0 when the variable is unset,
+// which every caller reads as no limit. Pass a static i64 initialised to -1 as the cache.
+u64 hc_env_mib (const char *name, i64 *cache);
 
 // Bounded appenders for a fixed size output buffer, used by outfile.c and potfile.c to build one
 // cracked line. buf_sz is the whole buffer, and 1 byte is always kept back for the caller's trailing
@@ -94,6 +102,11 @@ int hc_append_chr    (char *buf, const int len, const int buf_sz, const char c);
 // the base word is therefore the whole candidate. -1 means il_pos is past the end of the rectangle.
 
 HC_PLUGIN_API int pcfg_expand (const pcfg_cell_t *cell, const u32 *pool, const u32 *base, const u32 il_pos, u32 *w, const int base_len);
+
+// What tells this process apart from every other one writing into the same directory, the ones on
+// other machines included. See src/shared.c for what goes into it.
+
+HC_PLUGIN_API u64 hc_tmp_tag (void);
 
 HC_API u64 hc_peak_rss (void);
 

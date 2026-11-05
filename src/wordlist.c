@@ -77,6 +77,7 @@ int pw_transform_init (pw_transform_t *transform, hashcat_ctx_t *hashcat_ctx, co
   memset (transform, 0, sizeof (pw_transform_t));
 
   transform->pt_uppercase     = (hashconfig->opts_type & OPTS_TYPE_PT_UPPER) ? true : false;
+  transform->pt_lowercase     = (hashconfig->opts_type & OPTS_TYPE_PT_LOWER) ? true : false;
   transform->pt_hex           = (hashconfig->opts_type & OPTS_TYPE_PT_HEX)   ? true : false;
   transform->wordlist_autohex = generic_ctx->autohex_enable && user_options->wordlist_autohex;
 
@@ -120,7 +121,7 @@ int pw_transform_init (pw_transform_t *transform, hashcat_ctx_t *hashcat_ctx, co
     transform->iconv_enabled = true;
   }
 
-  const bool others = transform->pt_hex | transform->pt_uppercase | transform->iconv_enabled;
+  const bool others = transform->pt_hex | transform->pt_uppercase | transform->pt_lowercase | transform->iconv_enabled;
   const bool rules  = (run_rule_engine (transform->rule_len, transform->rule_buf) != 0);
 
   transform->autohex_only = (others == false) && (rules == false);
@@ -218,6 +219,7 @@ int pw_transform_apply (const pw_transform_t *transform, u8 *buf, const int len,
   // 3. what this hash mode hashes
 
   if (transform->pt_uppercase == true) uppercase (buf, (size_t) out_len);
+  if (transform->pt_lowercase == true) lowercase (buf, (size_t) out_len);
 
   // 4. the bytes the kernel gets
 
@@ -259,6 +261,10 @@ void pw_pre_add (hc_device_param_t *device_param, const u8 *pw_buf, const int pw
 
       pw_pre->base_len = base_len;
     }
+    else
+    {
+      pw_pre->base_len = 0;
+    }
 
     pw_pre->rule_idx = rule_idx;
 
@@ -272,11 +278,19 @@ void pw_pre_add (hc_device_param_t *device_param, const u8 *pw_buf, const int pw
   }
 }
 
-void pw_base_add (pw_batch_t *batch, const u64 pws_max, pw_pre_t *pw_pre)
+void pw_base_add (pw_batch_t *batch, const u64 pws_max, const pw_pre_t *pw_pre)
 {
   if (batch->pws_base_cnt < pws_max)
   {
-    memcpy (batch->pws_base + batch->pws_base_cnt, pw_pre, sizeof (pw_pre_t));
+    // Only the three fields build_debugdata () reads back out of this. The candidate itself reaches
+    // the batch through pw_add (), so copying pw_buf here would be a second copy of it.
+
+    pw_pre_t *pw_base = batch->pws_base + batch->pws_base_cnt;
+
+    memcpy (pw_base->base_buf, pw_pre->base_buf, pw_pre->base_len);
+
+    pw_base->base_len = pw_pre->base_len;
+    pw_base->rule_idx = pw_pre->rule_idx;
 
     batch->pws_base_cnt++;
   }

@@ -147,17 +147,29 @@ int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
   if (ikepsk->msg_len[5] >= 512) return (PARSER_SALT_LENGTH);
   if (ikepsk->nr_len  >= 64)  return (PARSER_SALT_LENGTH);
 
+  // tokens 0 to 7 take a len_min of 0, so an odd length reaches the loops below, where
+  // hex_to_u8 () reads two characters from a token that has one left
+
+  if (token.len[0] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[1] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[2] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[3] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[4] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[5] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[6] & 1) return (PARSER_TOKEN_LENGTH);
+  if (token.len[7] & 1) return (PARSER_TOKEN_LENGTH);
+
   u8 *ptr1 = (u8 *) ikepsk->msg_buf;
   u8 *ptr2 = (u8 *) ikepsk->nr_buf;
 
-  for (int i = 0; i < token.len[0]; i += 2) *ptr1++ = hex_to_u8 (token.buf[0] + i);
-  for (int i = 0; i < token.len[1]; i += 2) *ptr1++ = hex_to_u8 (token.buf[1] + i);
-  for (int i = 0; i < token.len[2]; i += 2) *ptr1++ = hex_to_u8 (token.buf[2] + i);
-  for (int i = 0; i < token.len[3]; i += 2) *ptr1++ = hex_to_u8 (token.buf[3] + i);
-  for (int i = 0; i < token.len[4]; i += 2) *ptr1++ = hex_to_u8 (token.buf[4] + i);
-  for (int i = 0; i < token.len[5]; i += 2) *ptr1++ = hex_to_u8 (token.buf[5] + i);
-  for (int i = 0; i < token.len[6]; i += 2) *ptr2++ = hex_to_u8 (token.buf[6] + i);
-  for (int i = 0; i < token.len[7]; i += 2) *ptr2++ = hex_to_u8 (token.buf[7] + i);
+  for (int i = 0; (i + 1) < token.len[0]; i += 2) *ptr1++ = hex_to_u8 (token.buf[0] + i);
+  for (int i = 0; (i + 1) < token.len[1]; i += 2) *ptr1++ = hex_to_u8 (token.buf[1] + i);
+  for (int i = 0; (i + 1) < token.len[2]; i += 2) *ptr1++ = hex_to_u8 (token.buf[2] + i);
+  for (int i = 0; (i + 1) < token.len[3]; i += 2) *ptr1++ = hex_to_u8 (token.buf[3] + i);
+  for (int i = 0; (i + 1) < token.len[4]; i += 2) *ptr1++ = hex_to_u8 (token.buf[4] + i);
+  for (int i = 0; (i + 1) < token.len[5]; i += 2) *ptr1++ = hex_to_u8 (token.buf[5] + i);
+  for (int i = 0; (i + 1) < token.len[6]; i += 2) *ptr2++ = hex_to_u8 (token.buf[6] + i);
+  for (int i = 0; (i + 1) < token.len[7]; i += 2) *ptr2++ = hex_to_u8 (token.buf[7] + i);
 
   *ptr1++ = 0x80;
   *ptr2++ = 0x80;
@@ -250,6 +262,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_benchmark_mask           = MODULE_DEFAULT;
   module_ctx->module_benchmark_charset        = MODULE_DEFAULT;
   module_ctx->module_benchmark_salt           = MODULE_DEFAULT;
+  module_ctx->module_benchmark_cost           = MODULE_DEFAULT;
   module_ctx->module_bridge_name              = MODULE_DEFAULT;
   module_ctx->module_bridge_type              = MODULE_DEFAULT;
   module_ctx->module_build_plain_postprocess  = MODULE_DEFAULT;
@@ -275,10 +288,12 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_hash_encode_status       = MODULE_DEFAULT;
   module_ctx->module_hash_encode_potfile      = MODULE_DEFAULT;
   module_ctx->module_hash_encode              = module_hash_encode;
+  module_ctx->module_hash_hints               = MODULE_DEFAULT;
   module_ctx->module_hash_init_selftest       = MODULE_DEFAULT;
   module_ctx->module_hash_mode                = MODULE_DEFAULT;
   module_ctx->module_hash_category            = module_hash_category;
   module_ctx->module_hash_name                = module_hash_name;
+  module_ctx->module_hash_recipe              = MODULE_DEFAULT;
   module_ctx->module_hashes_count_min         = MODULE_DEFAULT;
   module_ctx->module_hashes_count_max         = MODULE_DEFAULT;
   module_ctx->module_hlfmt_disable            = module_hlfmt_disable;
@@ -297,8 +312,10 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_kernel_loops_min         = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_max       = MODULE_DEFAULT;
   module_ctx->module_kernel_threads_min       = MODULE_DEFAULT;
+  module_ctx->module_kern_bits                = MODULE_DEFAULT;
   module_ctx->module_kern_type                = module_kern_type;
   module_ctx->module_kern_type_dynamic        = MODULE_DEFAULT;
+  module_ctx->module_length_sort              = MODULE_DEFAULT;
   module_ctx->module_opti_type                = module_opti_type;
   module_ctx->module_opts_type                = module_opts_type;
   module_ctx->module_outfile_check_disable    = MODULE_DEFAULT;
@@ -309,6 +326,7 @@ void module_init (module_ctx_t *module_ctx)
   module_ctx->module_pwdump_column            = MODULE_DEFAULT;
   module_ctx->module_pw_max                   = MODULE_DEFAULT;
   module_ctx->module_pw_min                   = MODULE_DEFAULT;
+  module_ctx->module_register_options         = MODULE_DEFAULT;
   module_ctx->module_salt_max                 = MODULE_DEFAULT;
   module_ctx->module_salt_min                 = MODULE_DEFAULT;
   module_ctx->module_salt_type                = module_salt_type;

@@ -38,13 +38,6 @@
 #include <errno.h>
 #include <inttypes.h>
 
-#if defined (_WIN)
-#include <process.h>
-#define FEED_GETPID _getpid
-#else
-#define FEED_GETPID getpid
-#endif
-
 // ---------------------------------------------------------------------------------------------
 // saying things
 // ---------------------------------------------------------------------------------------------
@@ -160,6 +153,13 @@ bool feed_param_is_setting (const char *arg)
     if (*p >= '0' && *p <= '9') continue;
     if (*p == '-') continue;
     if (*p == '_') continue;
+
+    // A dot, so that a key can name who it is for. -a 9 runs phases and a phase runs a feed of its
+    // own, so "rules.rulemax=500" says which of them the setting is for and the core hands the rest of
+    // it over. A path is not caught by this: it would have to begin with a letter, hold an equals sign,
+    // and hold nothing but key characters in front of it.
+
+    if (*p == '.') continue;
 
     return false;
   }
@@ -416,10 +416,10 @@ int feed_param_usage (const feed_param_t *params, char *out_buf, const size_t ou
 
     switch (p->type)
     {
-      case FEED_PARAM_TYPE_STR:  type = "=<str>";  break;
+      case FEED_PARAM_TYPE_STR:  type = "=<str>";    break;
       case FEED_PARAM_TYPE_BOOL: type = "=<yes|no>"; break;
-      case FEED_PARAM_TYPE_U64:  type = "=<num>";  break;
-      case FEED_PARAM_TYPE_DBL:  type = "=<real>"; break;
+      case FEED_PARAM_TYPE_U64:  type = "=<num>";    break;
+      case FEED_PARAM_TYPE_DBL:  type = "=<real>";   break;
     }
 
     char lhs[128];
@@ -901,12 +901,12 @@ static void feed_gpu_cache_key (hashcat_ctx_t *hashcat_ctx, const hc_device_para
 
   char ident[HCBUFSIZ_TINY];
 
-  const int ident_len = snprintf (ident, sizeof (ident), "%s-%d-%d-%d-%u-%u-%u-%s-%d-%u-%s-%s-%s-%d",
+  const int ident_len = snprintf (ident, sizeof (ident), "%s-%d-%d-%d-%s-%u-%u-%s-%d-%u-%s-%s-%s-%d",
     name,
     backend_ctx->comptime,
     backend_ctx->cuda_driver_version,
     backend_ctx->hip_runtimeVersion,
-    backend_ctx->metal_runtimeVersion,
+    (backend_ctx->metal_runtimeVersionStr != NULL) ? backend_ctx->metal_runtimeVersionStr : "",
     device_param->sm_major,
     device_param->sm_minor,
     (device_param->is_hip == true) ? device_param->gcnArchName : "",
@@ -994,7 +994,7 @@ static void feed_gpu_cache_write (const char *path, const void *buf, const size_
 
   char tmp[HCBUFSIZ_SMALL];
 
-  snprintf (tmp, sizeof (tmp), "%s.tmp.%d", path, (int) FEED_GETPID ());
+  snprintf (tmp, sizeof (tmp), "%s.tmp.%016" PRIx64, path, hc_tmp_tag ());
 
   HCFILE fp;
 
@@ -1658,8 +1658,8 @@ feed_gpu_t *feed_gpu_init (hashcat_ctx_t *hashcat_ctx, const int device_id, cons
   {
     // Metal, today. hc_mtlBuildOptionsToDict () does not hand the option string to a compiler: it
     // strips "-D ", splits on whitespace and drops anything that is not a name=value pair. And
-    // load_kernel () never writes a .metallib, so there would be a full cold build at every session
-    // start with no cache to fall back on.
+    // load_kernel () caches only the pipelines of a Metal program, so the library would be a full
+    // cold build at every session start.
 
     snprintf (reason, reason_size, "this backend cannot build a feed kernel");
 
@@ -1715,6 +1715,21 @@ feed_gpu_t *feed_gpu_init (hashcat_ctx_t *hashcat_ctx, const int device_id, cons
     feed_optv_add (&o, "-D MAX_THREADS_PER_BLOCK=%u", threads);
     feed_optv_add (&o, "--gpu-architecture=%s", device_param->gcnArchName);
     feed_optv_add (&o, "--gpu-max-threads-per-block=%u", threads);
+
+    // The same two options as the hiprtc build in backend.c, for the reasons given there: ISO C++17
+    // keeps linux and unix undefined in the include path M2S () expands, and the long branch factor
+    // keeps a relaxed branch in a called function off the return address. DTK's LLVM ends the
+    // process on an option it does not know.
+
+    feed_optv_add (&o, "-std=c++17");
+
+    const HIPRTC_PTR *hiprtc = backend_ctx->hiprtc;
+
+    if (hiprtc->is_dtk == false)
+    {
+      feed_optv_add (&o, "-mllvm");
+      feed_optv_add (&o, "-amdgpu-long-branch-factor=0");
+    }
 
     feed_optv_include_path (&o, folder_config, device_param, false);
   }

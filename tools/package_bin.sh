@@ -120,6 +120,7 @@ cp -r $IN/tunings                       $OUT/
 
 cp -r $IN/pcfg                          $OUT/
 
+cp    $IN/README.md                     $OUT/
 cp    $IN/example.dict                  $OUT/
 cp    $IN/example[0123456789]*.hash     $OUT/
 cp    $IN/example[0123456789]*.cmd      $OUT/
@@ -153,6 +154,7 @@ dos2unix $OUT/rules/*.rule
 dos2unix $OUT/rules/hybrid/*.rule
 dos2unix $OUT/docs/*
 dos2unix $OUT/docs/license_libs/*
+dos2unix $OUT/docs/plugin-development-workshop/*
 dos2unix $OUT/example*
 dos2unix $OUT/tools/*
 dos2unix $OUT/tunings/*
@@ -162,8 +164,10 @@ unix2dos $OUT/tables/layouts/*.table
 unix2dos $OUT/masks/*.hcmask
 unix2dos $OUT/rules/*.rule
 unix2dos $OUT/rules/hybrid/*.rule
+unix2dos $OUT/README.md
 unix2dos $OUT/docs/*
 unix2dos $OUT/docs/license_libs/*
+unix2dos $OUT/docs/plugin-development-workshop/*
 unix2dos $OUT/example*.cmd
 unix2dos $OUT/Python/*
 unix2dos $OUT/OpenCL/*
@@ -175,10 +179,13 @@ chmod 755 $OUT/rules
 chmod 644 $OUT/rules/*
 chmod 755 $OUT/rules/hybrid
 chmod 644 $OUT/rules/hybrid/*
+chmod 644 $OUT/README.md
 chmod 755 $OUT/docs
 chmod 644 $OUT/docs/*
 chmod 755 $OUT/docs/license_libs
 chmod 644 $OUT/docs/license_libs/*
+chmod 755 $OUT/docs/plugin-development-workshop
+chmod 644 $OUT/docs/plugin-development-workshop/*
 chmod 755 $OUT/charsets
 chmod 755 $OUT/charsets/*
 chmod 755 $OUT/tables
@@ -217,5 +224,11 @@ chmod 755 $OUT/libhashcat.so.$MAJOR
 chmod 644 $OUT/hashcat.hcstat2
 chmod 755 $OUT/tools/*hashcat.pl
 chmod 755 $OUT/tools/*hashcat.py
+
+# A reproducible archive needs every file to carry the same time on every build, and 7z stores it.
+
+if [ -n "$SOURCE_DATE_EPOCH" ]; then
+  find $OUT -exec touch -h -d @$SOURCE_DATE_EPOCH {} +
+fi
 
 time 7z a -t7z -m0=lzma2:d31 -mx=9 -mmt=8 -ms=on $OUT.7z $OUT

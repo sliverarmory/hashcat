@@ -17,7 +17,9 @@
 #include "mpsp.h"
 #include "terminal.h"
 #include "shared.h"
+#include "user_options.h"
 #include "status.h"
+#include "status_rc.h"
 
 static const char *const  ST_0000 = "Initializing";
 static const char *const  ST_0001 = "Autotuning";
@@ -287,6 +289,38 @@ bool status_get_skipped_warning_dev (const hashcat_ctx_t *hashcat_ctx, const int
   hc_device_param_t *device_param = &backend_ctx->devices_param[backend_devices_idx];
 
   return device_param->skipped_warning;
+}
+
+// A device is idle once its calc () has returned for the round, as long as another device is still
+// working. A device that never received any work is idle for the whole round, including the status
+// printed after the others finished. One whose first batch is still running on a slow hash has not
+// returned from calc () yet and so is not idle, although it has no kernel run recorded either.
+
+bool status_get_idle_dev (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx)
+{
+  const backend_ctx_t *backend_ctx = hashcat_ctx->backend_ctx;
+
+  const hc_device_param_t *device_param = &backend_ctx->devices_param[backend_devices_idx];
+
+  if (device_param->skipped         == true)  return false;
+  if (device_param->skipped_warning == true)  return false;
+  if (device_param->calc_done       == false) return false;
+
+  const bool never_ran = (device_param->speed_pos == 0) && (device_param->speed_cnt[0] == 0);
+
+  if (never_ran == true) return true;
+
+  for (int i = 0; i < backend_ctx->backend_devices_cnt; i++)
+  {
+    const hc_device_param_t *other = &backend_ctx->devices_param[i];
+
+    if (other->skipped         == true) continue;
+    if (other->skipped_warning == true) continue;
+
+    if (other->calc_done == false) return true;
+  }
+
+  return false;
 }
 
 char *status_get_session (const hashcat_ctx_t *hashcat_ctx)
@@ -816,6 +850,10 @@ int status_get_guess_base_count (const hashcat_ctx_t *hashcat_ctx)
   {
     const straight_ctx_t *straight_ctx = hashcat_ctx->straight_ctx;
 
+    // a pipe is one source, and it is not in the dictionary list
+
+    if (user_options_extra->wordlist_mode == WL_MODE_STDIN) return 1;
+
     return straight_ctx->dicts_cnt;
   }
 
@@ -1061,6 +1099,13 @@ char *status_get_guess_candidates_dev (const hashcat_ctx_t *hashcat_ctx, const i
     return display;
   }
 
+  if (status_get_idle_dev (hashcat_ctx, backend_devices_idx) == true)
+  {
+    snprintf (display, HCBUFSIZ_TINY, "[Idle]");
+
+    return display;
+  }
+
   if (user_options_extra->attack_kern == ATTACK_KERN_BF)
   {
     snprintf (display, HCBUFSIZ_TINY, "[Generating]");
@@ -1083,8 +1128,14 @@ char *status_get_guess_candidates_dev (const hashcat_ctx_t *hashcat_ctx, const i
     return display;
   }
 
-  const u64 outerloop_first = 0;
-  const u64 outerloop_last  = device_param->outerloop_left - 1;
+  // The ends of the batch, in the order the feed produced it. A length sort renumbers the work items,
+  // so slot 0 is then the shortest candidate rather than the first one and this field stops saying
+  // where in the wordlist the run has got to. The sort noted where the two ends went.
+
+  const bool sorted = (device_param->pws_sort_cnt == device_param->outerloop_left);
+
+  const u64 outerloop_first = (sorted == true) ? device_param->pws_sort_head : 0;
+  const u64 outerloop_last  = (sorted == true) ? device_param->pws_sort_tail : device_param->outerloop_left - 1;
 
   const u64 innerloop_first = 0;
   const u64 innerloop_last  = device_param->innerloop_left - 1;
@@ -1108,8 +1159,13 @@ char *status_get_guess_candidates_dev (const hashcat_ctx_t *hashcat_ctx, const i
   int plain_len1 = 0;
   int plain_len2 = 0;
 
-  build_plain ((hashcat_ctx_t *) hashcat_ctx, device_param, &plain1, plain_buf1, &plain_len1);
-  build_plain ((hashcat_ctx_t *) hashcat_ctx, device_param, &plain2, plain_buf2, &plain_len2);
+  // A batch can end while this reads it, and then a candidate cannot be built. The line keeps saying
+  // what the device is doing rather than showing two empty candidates.
+
+  const int rc1 = build_plain ((hashcat_ctx_t *) hashcat_ctx, device_param, &plain1, plain_buf1, &plain_len1, true);
+  const int rc2 = build_plain ((hashcat_ctx_t *) hashcat_ctx, device_param, &plain2, plain_buf2, &plain_len2, true);
+
+  if ((rc1 == -1) || (rc2 == -1)) return display;
 
   const bool always_ascii = (hashconfig->opts_type & OPTS_TYPE_PT_ALWAYS_ASCII) ? true : false;
 
@@ -1160,35 +1216,35 @@ char *status_get_guess_candidates_dev (const hashcat_ctx_t *hashcat_ctx, const i
   return display;
 }
 
-int status_get_digests_done (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_digests_done (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
   return hashes->digests_done;
 }
 
-int status_get_digests_done_pot (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_digests_done_pot (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
   return hashes->digests_done_pot;
 }
 
-int status_get_digests_done_zero (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_digests_done_zero (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
   return hashes->digests_done_zero;
 }
 
-int status_get_digests_done_new (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_digests_done_new (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
   return hashes->digests_done_new;
 }
 
-int status_get_digests_cnt (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_digests_cnt (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
@@ -1213,7 +1269,7 @@ double status_get_digests_percent_new (const hashcat_ctx_t *hashcat_ctx)
   return ((double) hashes->digests_done_new / (double) hashes->digests_cnt) * 100;
 }
 
-int status_get_salts_done (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_salts_done (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
@@ -1249,7 +1305,7 @@ u32 status_get_iteration_cnt (const hashcat_ctx_t *hashcat_ctx, const int salt_p
   return hashes->salts_buf[salt_pos].salt_iter;
 }
 
-int status_get_salts_cnt (const hashcat_ctx_t *hashcat_ctx)
+u32 status_get_salts_cnt (const hashcat_ctx_t *hashcat_ctx)
 {
   const hashes_t *hashes = hashcat_ctx->hashes;
 
@@ -1342,14 +1398,76 @@ char *status_get_time_started_relative (const hashcat_ctx_t *hashcat_ctx)
   return display_run;
 }
 
+// --stdin-count counts lines, and a line is a base word, so it is amplified the way every other base
+// word count is. Both multiplications are checked because the count is whatever the user typed, and
+// a wrapped total would read as a percentage rather than as no hint at all.
+
+static u64 status_get_stdin_count_words (const hashcat_ctx_t *hashcat_ctx)
+{
+  const user_options_t       *user_options       = hashcat_ctx->user_options;
+  const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
+
+  if (user_options_extra->wordlist_mode != WL_MODE_STDIN) return 0;
+
+  if (user_options->stdin_count_chgd == false) return 0;
+
+  const u64 amplifier = user_options_extra_amplifier ((hashcat_ctx_t *) hashcat_ctx);
+
+  if (overflow_check_u64_mul (user_options->stdin_count, amplifier) == true) return 0;
+
+  const u64 stdin_count_words = user_options->stdin_count * amplifier;
+
+  return stdin_count_words;
+}
+
+static u64 status_get_stdin_count_end (const hashcat_ctx_t *hashcat_ctx)
+{
+  const hashes_t *hashes = hashcat_ctx->hashes;
+
+  const u64 stdin_count_words = status_get_stdin_count_words (hashcat_ctx);
+
+  if (stdin_count_words == 0) return 0;
+
+  if (overflow_check_u64_mul (stdin_count_words, hashes->salts_cnt) == true) return 0;
+
+  const u64 stdin_count_end = stdin_count_words * hashes->salts_cnt;
+
+  // A --skip at or past the hint leaves nothing to measure against, and the figures relative to the
+  // skip would wrap.
+
+  if (stdin_count_end <= status_get_progress_skip (hashcat_ctx)) return 0;
+
+  return stdin_count_end;
+}
+
+bool status_get_stdin_count_exceeded (const hashcat_ctx_t *hashcat_ctx)
+{
+  const u64 stdin_count_end = status_get_stdin_count_end (hashcat_ctx);
+
+  if (stdin_count_end == 0) return false;
+
+  // Strictly greater, so that a stream of exactly --stdin-count lines can reach 100%.
+
+  const bool exceeded = (status_get_progress_cur (hashcat_ctx) > stdin_count_end);
+
+  return exceeded;
+}
+
 time_t status_get_sec_etc (const hashcat_ctx_t *hashcat_ctx)
 {
   const status_ctx_t         *status_ctx         = hashcat_ctx->status_ctx;
+  const user_options_t       *user_options       = hashcat_ctx->user_options;
   const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
 
   time_t sec_etc = 0;
 
-  if ((user_options_extra->wordlist_mode == WL_MODE_MASK) || (user_options_extra->wordlist_mode == WL_MODE_GENERIC))
+  // A pipe is estimated only against --stdin-count. --limit gives it a denominator as well, but never
+  // gave it an estimate, and that stays as it was. A pipe that ran dry short of the hint is finished,
+  // and a finished run has no time left.
+
+  const bool stdin_count = ((user_options_extra->wordlist_mode == WL_MODE_STDIN) && (user_options->stdin_count_chgd == true) && (status_ctx->devices_status != STATUS_EXHAUSTED));
+
+  if ((user_options_extra->wordlist_mode == WL_MODE_MASK) || (user_options_extra->wordlist_mode == WL_MODE_GENERIC) || (stdin_count == true))
   {
     if (status_ctx->devices_status != STATUS_CRACKED)
     {
@@ -1363,6 +1481,12 @@ time_t status_get_sec_etc (const hashcat_ctx_t *hashcat_ctx)
       if ((progress_end_relative_skip) > 0 && (hashes_msec_all > 0))
       {
         const u64 progress_left_relative_skip = progress_end_relative_skip - progress_cur_relative_skip;
+
+        // Salts are worked one after another, so a live salt can pass --stdin-count before a cracked
+        // salt later in the order is credited with the words it skipped. The work ignored is then more
+        // than the work left, and there is no estimate to give.
+
+        if (progress_ignore > progress_left_relative_skip) return 0;
 
         u64 msec_left = (u64) ((progress_left_relative_skip - progress_ignore) / hashes_msec_all);
 
@@ -1473,9 +1597,13 @@ u64 status_get_restore_point (const hashcat_ctx_t *hashcat_ctx)
 
 u64 status_get_restore_total (const hashcat_ctx_t *hashcat_ctx)
 {
-  const status_ctx_t *status_ctx = hashcat_ctx->status_ctx;
+  const status_ctx_t   *status_ctx   = hashcat_ctx->status_ctx;
+  const user_options_t *user_options = hashcat_ctx->user_options;
 
-  const u64 restore_total = status_ctx->words_base;
+  // A pipe's words_base is the unknown keyspace. The hint counts the same base words the restore
+  // point does, so under --stdin-count it is the total.
+
+  const u64 restore_total = (status_get_stdin_count_end (hashcat_ctx) > 0) ? user_options->stdin_count : status_ctx->words_base;
 
   return restore_total;
 }
@@ -1631,6 +1759,11 @@ u64 status_get_progress_ignore (const hashcat_ctx_t *hashcat_ctx)
 
   if (words_cnt == -1ULL) words_cnt = 0;
 
+  // A pipe has no words_cnt, so what is left of a cracked salt would be counted down from zero and
+  // wrap. The hint stands in for it.
+
+  if (status_get_stdin_count_end (hashcat_ctx) > 0) words_cnt = status_get_stdin_count_words (hashcat_ctx);
+
   if (status_ctx->words_limit)
   {
     const combinator_ctx_t *combinator_ctx = hashcat_ctx->combinator_ctx;
@@ -1728,22 +1861,65 @@ u64 status_get_progress_end (const hashcat_ctx_t *hashcat_ctx)
       // exactly needs the feed to say how many candidates lie before a given base word, which the
       // level index could answer and does not expose.
 
-      else if (user_options_extra->attack_kern == ATTACK_KERN_PCFG)     progress_end  *= hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE].dev_avg;
+      else if (user_options_extra->attack_kern == ATTACK_KERN_PCFG)
+      {
+        // And once the rules are applied inside the engine, every candidate the cell makes is tried once
+        // per rule, so what a base word comes to is the mean cell times the ruleset. The mean and the
+        // ruleset are both u32 and their product cannot leave a u64, so the check belongs on the total
+        // below, where --limit takes whatever the user gives it and a wrapped figure would read as a
+        // percentage rather than as the overflow it is.
+
+        u64 amplifier = hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE].dev_avg;
+
+        if (hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE].global_ctx.dev_rules == true)
+        {
+          const u32 rules_cnt = hashcat_ctx->straight_ctx->kernel_rules_cnt;
+
+          amplifier = amplifier * rules_cnt;
+        }
+
+        progress_end = (overflow_check_u64_mul (progress_end, amplifier) == true) ? UINT64_MAX : (progress_end * amplifier);
+      }
     }
   }
 
-  // -a 9 splitting its own hash file runs its rounds as one attack, so the progress it counts is the
-  // whole queue and the total it is measured against has to be the whole queue too.
+  // A pipe cannot say how long it is, so --stdin-count says it instead. The hint is only shown, never
+  // handed to dispatch, which reads the pipe to its end whatever it says. Once the pipe has given more
+  // than that, the hint was wrong and the progress is the count on its own, as it is without one.
+
+  const u64 stdin_count_end = status_get_stdin_count_end (hashcat_ctx);
+
+  if (stdin_count_end > 0)
+  {
+    progress_end = (status_get_stdin_count_exceeded (hashcat_ctx) == true) ? 0 : stdin_count_end;
+  }
+
+  // -a 9 splitting its own hash file runs its phases as one attack, so the progress it counts is the
+  // whole run and the total it is measured against has to be the whole run too.
   //
-  // The multiplication is exact rather than an estimate. Every round pairs one word with every digest,
-  // and generic_association_in_sync refuses any round where that is not true, so a round is always
-  // words_cnt candidates and there are dicts_cnt of them.
+  // It used to multiply this phase by the number of phases, which was right while a phase was one word
+  // position and every one of them was the same size. Phases are not: running a rule list over every
+  // hash is a thousand times the work of trying the words alone, and the grammar phase has no end at
+  // all. Multiplying therefore made a finished phase read as a fraction of itself.
+  //
+  // The total is everything sized so far instead, which is what words_walk_cnt already holds. It is not
+  // known in full at the start, because sizing a phase means opening it and the grammar phase takes
+  // seconds to load, so it grows when a phase opens. What that buys is a progress that never resets and
+  // never goes backwards, and a percentage that is honest about the work hashcat has actually measured.
+  //
+  // --limit is left alone. It is refused for more than one phase, so where it applies there is only one
+  // phase and the two answers are the same anyway.
 
   if (user_options_extra->association_autosplit == true)
   {
-    const straight_ctx_t *straight_ctx = hashcat_ctx->straight_ctx;
+    if (status_ctx->words_limit == 0)
+    {
+      // A queue holding a phase whose keyspace does not fit a u64 saturates the sum, and then there is
+      // no denominator to give. Zero is how the rest of this function says that, and the progress line
+      // prints the count on its own, which is what every attack hashcat cannot size already does.
 
-    if (straight_ctx->dicts_cnt > 1) progress_end *= straight_ctx->dicts_cnt;
+      progress_end = (status_ctx->words_walk_cnt == (u64) -1) ? 0 : status_ctx->words_walk_cnt;
+    }
   }
 
   return progress_end;
@@ -1847,6 +2023,10 @@ double status_get_hashes_msec_dev (const hashcat_ctx_t *hashcat_ctx, const int b
   double speed_msec = 0;
 
   hc_device_param_t *device_param = &backend_ctx->devices_param[backend_devices_idx];
+
+  // An idle device's last speed would otherwise count towards Speed.#* and Time.Estimated.
+
+  if (status_get_idle_dev (hashcat_ctx, backend_devices_idx) == true) return 0;
 
   if ((device_param->skipped == false) && (device_param->skipped_warning == false))
   {
@@ -1960,6 +2140,10 @@ int status_get_cpt_cur_min (const hashcat_ctx_t *hashcat_ctx)
 
   if (status_ctx->accessible == false) return 0;
 
+  // cpt_ctx_init () leaves the buffer out in identify mode and in the other modes that crack nothing
+
+  if (cpt_ctx->enabled == false) return 0;
+
   const time_t now = time (NULL);
 
   int cpt_cur_min = 0;
@@ -1985,6 +2169,8 @@ int status_get_cpt_cur_hour (const hashcat_ctx_t *hashcat_ctx)
 
   if (status_ctx->accessible == false) return 0;
 
+  if (cpt_ctx->enabled == false) return 0;
+
   const time_t now = time (NULL);
 
   int cpt_cur_hour = 0;
@@ -2009,6 +2195,8 @@ int status_get_cpt_cur_day (const hashcat_ctx_t *hashcat_ctx)
   const status_ctx_t *status_ctx = hashcat_ctx->status_ctx;
 
   if (status_ctx->accessible == false) return 0;
+
+  if (cpt_ctx->enabled == false) return 0;
 
   const time_t now = time (NULL);
 
@@ -2699,7 +2887,7 @@ u64 status_get_progress_dev (const hashcat_ctx_t *hashcat_ctx, const int backend
   if (device_param->skipped == true) return 0;
   if (device_param->skipped_warning == true) return 0;
 
-  return device_param->outerloop_left;
+  return device_param->outerloop_progress;
 }
 
 double status_get_runtime_msec_dev (const hashcat_ctx_t *hashcat_ctx, const int backend_devices_idx)
@@ -2736,6 +2924,27 @@ int status_get_kernel_loops_dev (const hashcat_ctx_t *hashcat_ctx, const int bac
 
   if (device_param->skipped == true) return 0;
   if (device_param->skipped_warning == true) return 0;
+
+  // The device engine has no loop count to report: a base word becomes its whole cell of candidates in
+  // one launch, and kernel_loops is pinned and unread there. What the field means for every other
+  // attack, how many candidates one base word turns into, is the mean cell, which is the same figure
+  // the progress total and --keyspace already multiply by.
+
+  const user_options_extra_t *user_options_extra = hashcat_ctx->user_options_extra;
+
+  if (user_options_extra->attack_kern == ATTACK_KERN_PCFG)
+  {
+    // Unless the rules are applied inside it. Then kernel_loops is read again, and it sizes the chunk of
+    // the ruleset the launch was given, which is what this field says for a straight attack with rules:
+    // -a 0 over 66 rules shows 66. So that run falls through to the general answer below.
+
+    if (hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE].global_ctx.dev_rules == false)
+    {
+      const u32 dev_avg = hashcat_ctx->generic_ctx[GENERIC_ROLE_BASE].dev_avg;
+
+      if (dev_avg > 0) return (int) dev_avg;
+    }
+  }
 
   if (device_param->kernel_loops_prev) return device_param->kernel_loops_prev;
 
@@ -2826,6 +3035,8 @@ int status_ctx_init (hashcat_ctx_t *hashcat_ctx)
 
   status_ctx->devices_status = STATUS_INIT;
 
+  status_clear_rc_error (hashcat_ctx);
+
   status_ctx->run_main_level1     = true;
   status_ctx->run_main_level2     = true;
   status_ctx->run_main_level3     = true;
@@ -2857,6 +3068,15 @@ void status_ctx_destroy (hashcat_ctx_t *hashcat_ctx)
   hc_thread_mutex_delete (status_ctx->mux_counter);
   hc_thread_mutex_delete (status_ctx->mux_display);
   hc_thread_mutex_delete (status_ctx->mux_hwmon);
+
+  // The last round's strings and per device arrays are still in this struct, and this is the only
+  // place left that can give them back. accessible is false by now and status_status_destroy ()
+  // returns early when it is, so the flag is raised for this one call and the memset below clears
+  // it again. Raising it is safe here because every thread has been joined before this runs.
+
+  status_ctx->accessible = true;
+
+  status_status_destroy (hashcat_ctx, status_ctx->hashcat_status_final);
 
   hcfree (status_ctx->hashcat_status_final);
 
@@ -2907,6 +3127,11 @@ void status_status_destroy (hashcat_ctx_t *hashcat_ctx, hashcat_status_t *hashca
   hashcat_status->brain_tx_all            = NULL;
   #endif
 
+  // hwmon_fan_dev below is allocated by status_get_hwmon_fan_dev () next to speed_sec_dev,
+  // guess_candidates_dev and hwmon_dev, and was released by nothing at all. Its declaration in
+  // include/types.h is Apple only and so is this, which is why it sits inside a guard the other
+  // three do not need.
+
   for (int device_id = 0; device_id < hashcat_status->device_info_cnt; device_id++)
   {
     device_info_t *device_info = hashcat_status->device_info_buf + device_id;
@@ -2914,6 +3139,9 @@ void status_status_destroy (hashcat_ctx_t *hashcat_ctx, hashcat_status_t *hashca
     hcfree (device_info->speed_sec_dev);
     hcfree (device_info->guess_candidates_dev);
     hcfree (device_info->hwmon_dev);
+    #if defined (__APPLE__)
+    hcfree (device_info->hwmon_fan_dev);
+    #endif
     #ifdef WITH_BRAIN
     hcfree (device_info->brain_link_recv_bytes_dev);
     hcfree (device_info->brain_link_send_bytes_dev);
@@ -2924,6 +3152,9 @@ void status_status_destroy (hashcat_ctx_t *hashcat_ctx, hashcat_status_t *hashca
     device_info->speed_sec_dev                  = NULL;
     device_info->guess_candidates_dev           = NULL;
     device_info->hwmon_dev                      = NULL;
+    #if defined (__APPLE__)
+    device_info->hwmon_fan_dev                  = NULL;
+    #endif
     #ifdef WITH_BRAIN
     device_info->brain_link_recv_bytes_dev      = NULL;
     device_info->brain_link_send_bytes_dev      = NULL;

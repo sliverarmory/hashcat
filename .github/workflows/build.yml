@@ -30,6 +30,7 @@ env:
     modules/
     OpenCL/
     pcfg/
+    Python/
     rules/
     tunings/
     example*
@@ -89,6 +90,14 @@ jobs:
             os_name: Linux
             os_name_lowercase: linux
             shared: 1
+          - os: ubuntu-24.04-arm
+            os_name: Linux-ARM64-RPi4
+            os_name_lowercase: linux-arm64-rpi4
+            shared: 0
+          - os: ubuntu-24.04-arm
+            os_name: Linux-ARM64-RPi4
+            os_name_lowercase: linux-arm64-rpi4
+            shared: 1
           - os: macos-latest
             os_name: macOS
             os_name_lowercase: macos
@@ -131,6 +140,12 @@ jobs:
             mingw-w64-x86_64-toolchain
             python3
 
+      - name: Install dependencies (Linux-ARM64-RPi4 only)
+        if: matrix.os_name_lowercase == 'linux-arm64-rpi4'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm
+
       - name: Setup Rustup (Windows only)
         if: matrix.os_name_lowercase == 'windows'
         shell: msys2 {0}
@@ -146,9 +161,17 @@ jobs:
         env:
           SHARED: ${{ matrix.shared }}
           PATH: /mingw64/bin:$PATH
-          WIN_PYTHON: ""
         run: |
           make ENABLE_LTO=0 CC=clang CXX=clang++
+          bash tools/test_package.sh . --no-device
+
+      - name: Build (Linux-ARM64-RPi4)
+        if: matrix.os_name_lowercase == 'linux-arm64-rpi4'
+        env:
+          SHARED: ${{ matrix.shared }}
+          TERM: xterm
+        run: |
+          make ENABLE_LTO=0 MCPU=cortex-a72 CC=clang CXX=clang++ AR=llvm-ar
           bash tools/test_package.sh . --no-device
 
       - name: Build (Linux/macOS)
@@ -188,6 +211,7 @@ jobs:
         if: matrix.os_name_lowercase == 'linux' && matrix.shared == 0
         env:
           SHARED: ${{ matrix.shared }}
+          DOCS_BOT: ${{ vars.DOCS_BOT }}
         run: |
           # https://github.com/actions/checkout?tab=readme-ov-file#push-a-commit-using-the-built-in-token
           git config user.name "github-actions[bot]"
@@ -195,10 +219,44 @@ jobs:
           git add docs/hashcat-help.md
           git add docs/hashcat-example-hashes.md
           if ! git diff --staged --quiet; then
-            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # The repository variable DOCS_BOT=manual holds the commit back, for a release that
+            # carries its generated docs itself. The diff is still printed below.
+            if [ "$DOCS_BOT" = "manual" ]; then
+              echo "DOCS_BOT is manual: not committing docs/hashcat-help.md or docs/hashcat-example-hashes.md"
+              git diff --staged | cat
+            elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
               if [ "$GITHUB_REF_NAME" = "master" ]; then
                 git commit -m "Automatically updated docs/hashcat-help.md or docs/hashcat-example-hashes.md (by Github Action)"
-                git push
+
+                # Several commits can land on master close together, each starting a Build that
+                # regenerates and pushes these docs, so this push can be rejected as a non fast
+                # forward. Rebase our docs only commit onto the latest master and retry. If a
+                # concurrent run already pushed the docs the rebase finds nothing to replay and we
+                # stop, since that run has them. Five attempts absorb the race seen in practice, so
+                # if none of them land the push is failing for another reason (the token lost write
+                # access, say), and the step exits 1 to surface that rather than let the docs go
+                # stale with no run showing it.
+                pushed=0
+                for attempt in 1 2 3 4 5; do
+                  if git push origin "HEAD:$GITHUB_REF_NAME"; then
+                    pushed=1
+                    break
+                  fi
+                  echo "push rejected on attempt $attempt, rebasing onto the latest $GITHUB_REF_NAME"
+                  git fetch origin "$GITHUB_REF_NAME"
+                  if ! git rebase "origin/$GITHUB_REF_NAME"; then
+                    git rebase --abort
+                    git reset --hard "origin/$GITHUB_REF_NAME"
+                    echo "docs already current after a concurrent run, nothing to push"
+                    pushed=1
+                    break
+                  fi
+                  sleep $(( (RANDOM % 5) + 2 ))
+                done
+                if [ "$pushed" = 0 ]; then
+                  echo "docs push did not land in 5 attempts; this is not the race the retries cover, failing the step"
+                  exit 1
+                fi
               else
                 echo "Not on master branch (currently: $GITHUB_REF_NAME): skipping commit because otherwise we may be in detached head"
               fi
@@ -239,12 +297,6 @@ jobs:
                wget ca-certificates zstd tar git make pkg-config llvm cmake g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 libc++-dev libc++abi-dev lld pkg-config python3
 
           mkdir ~/src && cd ~/src
-          mkdir /opt/win-python && cd /opt/win-python
-          wget https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-python-3.14.7-1-any.pkg.tar.zst
-          unzstd mingw-w64-x86_64-python-3.14.7-1-any.pkg.tar.zst
-          tar -xf mingw-w64-x86_64-python-3.14.7-1-any.pkg.tar
-
-          cd ~/src
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
           export PATH="$HOME/.cargo/bin:${PATH}"
           rustup target add x86_64-pc-windows-gnu

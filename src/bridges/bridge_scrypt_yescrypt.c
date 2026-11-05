@@ -236,7 +236,7 @@ void salt_destroy (MAYBE_UNUSED hashcat_ctx_t *hashcat_ctx, void *platform_conte
   }
 }
 
-bool launch_loop (MAYBE_UNUSED hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED void *platform_context, MAYBE_UNUSED hc_device_param_t *device_param, MAYBE_UNUSED hashconfig_t *hashconfig, MAYBE_UNUSED hashes_t *hashes, MAYBE_UNUSED const u32 salt_pos, MAYBE_UNUSED const u64 pws_cnt)
+bool launch_loop (hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED void *platform_context, MAYBE_UNUSED hc_device_param_t *device_param, MAYBE_UNUSED hashconfig_t *hashconfig, MAYBE_UNUSED hashes_t *hashes, MAYBE_UNUSED const u32 salt_pos, MAYBE_UNUSED const u64 pws_cnt)
 {
   bridge_scrypt_yescrypt_t *bridge_scrypt_yescrypt = platform_context;
 
@@ -246,14 +246,14 @@ bool launch_loop (MAYBE_UNUSED hashcat_ctx_t *hashcat_ctx, MAYBE_UNUSED void *pl
 
   salt_t *salts_buf = (salt_t *) hashes->salts_buf;
 
-  salt_t *salt_buf = &salts_buf[salt_pos];
-
   // hashcat guarantees h_tmps[] is 64 byte aligned, so is *B
 
   scrypt_tmp_t *scrypt_tmp = (scrypt_tmp_t *) device_param->h_tmps;
 
   for (u64 pw_cnt = 0; pw_cnt < pws_cnt; pw_cnt++)
   {
+    salt_t *salt_buf = &salts_buf[bridge_salt_pos (hashcat_ctx, device_param, hashes, salt_pos, pw_cnt)];
+
     u8 *B = (u8 *) scrypt_tmp->B;
 
     // We could use p-based parallelization from yescrypt instead,
@@ -288,6 +288,7 @@ void bridge_init (bridge_ctx_t *bridge_ctx)
   bridge_ctx->get_unit_info         = get_unit_info;
   bridge_ctx->get_workitem_count    = get_workitem_count;
   bridge_ctx->get_workitem_multiple = get_workitem_multiple;
+  bridge_ctx->get_unit_tuning       = BRIDGE_DEFAULT;
   bridge_ctx->thread_init           = BRIDGE_DEFAULT;
   bridge_ctx->thread_term           = BRIDGE_DEFAULT;
   bridge_ctx->salt_prepare          = salt_prepare;
