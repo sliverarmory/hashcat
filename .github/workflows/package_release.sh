@@ -198,7 +198,7 @@ if [ "$platform" = "windows" ]; then
 
   binary_version="$EXPECTED_VERSION"
 else
-  binary_version="$("$binary" --version)"
+  binary_version="$(HASHCAT_MODULE_CACHE_DISABLE=1 "$binary" --version)"
 fi
 
 case "$binary_version" in
